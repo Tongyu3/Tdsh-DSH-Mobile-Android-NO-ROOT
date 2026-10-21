@@ -18,6 +18,34 @@
 
   var NARROW_PX = 700;          // 窄屏阈值
   /*
+   * 顶部布局与轮询的统一参数。
+   *
+   * 之前这三个数字散在三处硬写（6 / 800 / 15），改一处就把另一处碰歪 ——
+   * 下面的鲸鱼、侧边栏、主界面三个定位都只读这里。
+   */
+  var TOP_GAP     = 6;          // 顶部留白：状态栏高度减去它
+  var POLL_MS     = 2000;       // 主题 / 位置校准间隔（原 800ms，2026-10 发热优化）
+  var RAIL_NUDGE  = 0;          // 悬浮鲸鱼相对内容基准的微调（当前为 0）
+
+  /*
+   * 定时器回收：以前 setInterval 只挂不清，WebView 重载一次就多一套计时器，
+   * 越用越费电。现在统一走这个包装，页面卸载时全清。
+   */
+  var timers = [];
+  function every(fn, ms) { var h = setInterval(fn, ms); timers.push(h); return h; }
+  /*
+   * 页面不在前台时**不做**这些周期性校准（2026-10 发热优化）。
+   * 用户切到别的 App / 息屏后，WebView 仍会按计时器醒来跑 JS —— 白花 CPU 和电，
+   * 而校准结果根本没人看见。回来时各处的 focus/visibility 回调都会再对一次。
+   */
+  function guarded(fn) {
+    return function () { try { if (document.hidden) return; } catch (e) { } return fn(); };
+  }
+  W.addEventListener('pagehide', function () {
+    for (var i = 0; i < timers.length; i++) clearInterval(timers[i]);
+    timers.length = 0;
+  });
+  /*
    * ⚠️ 页面加载失败时，Chromium 显示的是自己的内置错误页
    * （chrome-error://chromewebdata/），那个文档里 **documentElement 是 null**。
    * 我们在 onPageFinished 里是无条件注入的，所以这里必须先退出：
@@ -32,6 +60,24 @@
   var wasOpen = false;          // 设置弹窗上一次是否处于打开状态
 
   var CSS = [
+    /*
+     * ══════════ 点击手感（2026-10-21 用户报"点按钮动画卡顿"）══════════
+     *
+     * 两行都是"去掉浏览器自带的坏东西"，不改变任何布局：
+     *
+     * ① `-webkit-tap-highlight-color:transparent`
+     *    Android WebView 默认会给每个可点元素叠一层**半透明灰块**，按下去先闪一下灰，
+     *    再叠上 DSH 自己的按压动画 —— 两套反馈打架，看起来就是"卡一下"。
+     *    这个值**必须加 !important**：DSH 前端自己也设了它，不加就压不住。
+     *
+     * ② `touch-action:manipulation`
+     *    关掉"双击缩放"。不关的话 WebView 每次点击都要**先等 300ms** 看是不是双击，
+     *    所有按钮的反馈都被推迟 0.3 秒 —— 这就是"点下去半天才有反应"的来源。
+     *    manipulation 仍然允许单指滑动和双指缩放，只是不再等双击。
+     */
+    'html{-webkit-tap-highlight-color:transparent!important;}',
+    'html,body,a,button,[role="button"],[role="treeitem"],input,textarea,'
+        + '[contenteditable="true"]{touch-action:manipulation!important;}',
     /*
      * ⚠️ 必须用 :has(> nav) 把"设置弹窗"和其它弹窗区分开。
      *
@@ -131,17 +177,36 @@
      * 左上角浮动鲸鱼按钮：侧边栏收起后用它唤出。
      * 只在收起状态显示（展开后 DSH 自己的侧边栏里就有切换按钮）。
      */
+    /*
+     * 左上角浮动鲸鱼按钮 —— 2026-10-17 重做外观 + 修位置。
+     *
+     * 改动前：42×42 深灰圆片、白色鲸鱼、右下还压着一个小方块图标；
+     *         top 算成「8 + 状态栏高度」，比标题行低一整行，盖住「对话 / 轨迹」标签。
+     * 改动后：40×40 浅色圆角方块（squircle）、蓝色鲸鱼、去掉内层小图标；
+     *         top 直接取状态栏高度，与标题行齐平。
+     */
     '#dsh-rail-btn{',
-    '  position:fixed;left:8px;top:8px;width:42px;height:42px;',
+    /*
+     * top 运行时由 pinRailBelowStatusBar() 覆盖成「状态栏高度 / dpr」，
+     * 这里 8px 只是首帧兜底。
+     */
+    '  position:fixed;left:10px;top:8px;width:40px;height:40px;',
+    /* 圆形（2026-10-17 用户要求改回球形）—— 方形改 50% 圆角即可，尺寸不动 */
     '  border:none;border-radius:50%;z-index:950;',
-    '  background:rgba(32,33,36,.62);color:#fff;cursor:pointer;',
+    '  background:rgba(255,255,255,.94);color:#3b6ef5;cursor:pointer;',
     '  display:flex;align-items:center;justify-content:center;',
-    '  -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);',
-    '  box-shadow:0 2px 10px rgba(0,0,0,.35);',
+    '  box-shadow:0 1px 4px rgba(0,0,0,.14);',
     '  transition:opacity .2s ease,transform .22s cubic-bezier(.33,1,.68,1);',
     '  opacity:1;transform:scale(1);',
     '}',
-    '#dsh-rail-btn svg{width:24px;height:24px;}',
+    '#dsh-rail-btn svg{width:22px;height:22px;}',
+    /* 按下反馈：原来点下去没任何变化，发虚。只缩 6%，不影响位置。 */
+    '#dsh-rail-btn:active{transform:scale(.94);}',
+    /*
+     * ⚠️ 不要用 `#dsh-rail-btn > :not(svg)` 去清内层 ——
+     * 实测鲸鱼本身就是个非 svg 的子节点，那条规则会把鲸鱼一起隐藏，
+     * 只剩 DSH 自带的侧边栏图标（2026-10-17 踩到，已撤）。
+     */
     /* 用淡出+缩小代替 display 切换，才有过渡动画 */
     'body:not([data-dsh-rail-hidden="1"]) #dsh-rail-btn{',
     '  opacity:0;transform:scale(.8);pointer-events:none;',
@@ -560,7 +625,7 @@
     function markPendingReturn() {
       try {
         root.setAttribute('data-dsh-view', 'list');
-        var t = setInterval(function () {
+        var t = every(function () {
           if (document.visibilityState !== 'visible') return;
           root.setAttribute('data-dsh-view', 'list');
           scheduleApply();
@@ -652,6 +717,19 @@
     var collapsed = !!side.querySelector('[class*="collapsed"]');
 
     /*
+     * ⚠️ 第七轮那个"按 DSH 按钮标签反向镜像状态"的 observer 与轮询已**删除**。
+     *
+     * 逐帧实测（tools/rail-who-moves.js）证明 DSH 的按钮标签**跟画面不对应**：
+     * 点它标签会翻转，但抽屉 tx 恒为 0（一动不动）。
+     * 于是"按标签写我们的属性"会把画面**写反** ——
+     * 用户点侧边栏的关闭按钮时 DSH 把标签改成「收起」，我们据此把抽屉**打开**，
+     * 这就是他报的"关不掉"。
+     *
+     * 现在状态只有一份：`body[data-dsh-rail-hidden]`，由 requestRail 直接写。
+     * 没有第二个写者，也就不会有互相覆盖。
+     */
+
+    /*
      * 清掉旧版补丁遗留在内联样式上的 !important —— 重新注入（不刷新页面）时，
      * 内联样式会盖过新 CSS，导致"改了却没效果"。
      */
@@ -672,39 +750,86 @@
         ev.preventDefault();
         ev.stopPropagation();
         /*
-         * 先乐观地把状态切到"展开"，再触发 DSH 自己的切换。
+         * ★ 纯委托（第五轮定稿）：状态权威只有 DSH 一个。
          *
-         * 为什么：真正的状态同步是靠 MutationObserver + 150ms 去抖的，
-         * 如果只等它，抽屉会在点击后 150ms 才开始动 —— 手感上就是"顿一下再弹出来"。
-         * 这里提前置位，动画就能从**这一帧**开始。
+         * 历次踩的坑都指向同一件事 —— **我们不该自己去改状态**：
+         *   · 第一版"先乐观置位 requestRail(false)，再当场找 DSH 按钮点击"：
+         *     写 railExplicitShowUntil 把自动同步挡掉 600ms，DSH 随后的展开
+         *     反而没人跟进，状态停在收起（真机实测 800ms 后仍是收起 ❌）；
+         *   · 现在 requestRail 自己就负责"去点 DSH 的正确按钮"
+         *     （见 requestRail 的第四轮说明），所以这里只需要调用它。
          */
-        requestRail(false);
-        var o = document.querySelector('[class*="sidebarCol"] button[aria-label*="侧边栏"]');
-        if (o) o.click();
+        requestRail(false, true);
       }, true);
       document.body.appendChild(btn);
     }
 
-    if (collapsed) {
-      /*
-       * 只切换一个 body 属性 —— 栅格列宽、抽屉宽度与位移**全部交给 CSS**。
-       *
-       * 之前这里用内联 !important 去改 width / min-width / overflow /
-       * grid-template-columns，既和 CSS 互相打架，也正是动画跳变的来源
-       * （内联的 grid-template-columns 让轨道数在 3 与 1 之间跳）。
-       * 另外注意：仍然不能用 display:none —— 侧边栏是栅格 item，
-       * 移出栅格流会让后面的列整体前移一格，整屏会变空白。
-       */
+    /*
+     * ★★★ 冷启动初始态（本次线上报障的修复点）。
+     *
+     * 【现象】新装/冷启动后一进应用就是**一个大开着的侧边栏**（只有图标那一列），
+     *   主界面被挤到右边，看着像"卡在一个陌生界面"。
+     *
+     * 【触发条件】仅冷启动（进程首次进入）；之后手动开关都正常。
+     *
+     * 【根因】CSS 的判据是 `body:not([data-dsh-rail-hidden="1"]) [class*=sidebarCol]{
+     *   transform:none }` —— 属性**不存在**就等于"展开"。
+     * 而启动时没有任何代码写过这个属性，原来负责写它的
+     * `syncDshLabelToRail()` 是这么找按钮的：
+     *     findRailToggle(!hiddenNow)   // hiddenNow=false → 找「打开侧边栏」
+     * 偏偏「打开侧边栏」按钮被我们自己的 CSS 设成了 `display:none`，
+     * querySelector 找不到 → 函数直接返回 false → **属性从来没被写** → 抽屉以展开态启动。
+     * （这也是"隐身按钮"这个设计带来的副作用：状态同步依赖一个不可见的按钮。）
+     *
+     * 【修法】不再依赖找按钮：冷启动时由补丁**直接确定初始态 = 收起**，
+     * 这正是本 App 的手机端设计（先看对话，点左上角鲸鱼唤出抽屉）。
+     * 用模块级一次性标记，避免每次 apply() 都把用户手动打开的抽屉强行关掉。
+     */
+    initRailOnce();
+
+  }
+
+  /**
+   * 冷启动只做一次：把抽屉的初始态定为**收起**。
+   *
+   * 详见调用处（patchSidebar 里）的根因说明：
+   * 属性"不存在"就等于展开，而启动时没人写过它，于是以展开态启动。
+   *
+   * 用一次性标记而不是"每次 apply 都写"：
+   * apply() 会因为 DOM 变化被反复调用，若每次都写 '1'，
+   * 用户手动打开抽屉后会被下一次 apply 又关掉（那是另一种 bug）。
+   */
+  function initRailOnce() {
+    if (W.__dshRailInit) return;
+    W.__dshRailInit = true;
+    try {
       document.body.setAttribute('data-dsh-rail-hidden', '1');
-    } else {
-      /*
-       * ⚠️ 只有在**闩锁过期**后才允许按类名把状态改回"展开"。
-       * 收起动画中途 DSH 会短暂没有 collapsed 类（见 requestRail 的说明），
-       * 若这里照做，抽屉会弹回来 —— 就是那个"抽搐"。
-       */
-      if (Date.now() < railLatchUntil) return;
-      document.body.removeAttribute('data-dsh-rail-hidden');
-    }
+      railDiag('冷启动初始态 → 收起');
+    } catch (e) { }
+  }
+
+  /**
+   * 把 **DSH 的按钮标签**对齐到我们这份真相（方向是"真相 → DSH"，不是反过来）。
+   *
+   * 为什么方向不能反：逐帧实测（tools/rail-who-moves.js）证明 DSH 的标签
+   * 跟画面不对应 —— 点它的按钮，标签翻转但抽屉 tx 恒为 0。
+   * 若按标签写我们的属性，就会把画面写反（"关不掉"就是这么来的）。
+   *
+   * 只在标签确实与目标不符时才点，避免把 DSH 的状态翻反。
+   */
+  function syncDshLabelToRail() {
+    try {
+      var hiddenNow = document.body.getAttribute('data-dsh-rail-hidden') === '1';
+      // 想要"收起" → DSH 的按钮应显示「收起侧边栏」；反之显示「打开侧边栏」
+      var mismatched = findRailToggle(!hiddenNow);
+      if (mismatched) {
+        var prev = railDelegating;
+        railDelegating = true;
+        try { mismatched.btn.click(); } finally { railDelegating = prev; }
+        return true;
+      }
+    } catch (e) { }
+    return false;
   }
 
   /**
@@ -724,19 +849,357 @@
    * 等过渡结束（闩锁过期）再按最终类名校准。
    */
   var railLatchUntil = 0;
+  /**
+   * 「用户刚刚明确要求展开抽屉」的窗口。
+   *
+   * 与 {@link railLatchUntil} 的区别（这个区分是本 bug 的关键）：
+   *   · railLatchUntil —— 防止**自动同步**被收起动画的中间态骗到（防"抽搐"）；
+   *   · railExplicitShowUntil —— 用户明确点了展开时，让自动同步**先别管**。
+   * 早先把两者混为一个，结果防抽搐的那道也把用户的操作挡住了，
+   * 表现就是"收起后马上再点开 → 又被压回收起"（用户报的"回弹"）。
+   */
+  var railExplicitShowUntil = 0;
 
-  /** 明确请求抽屉的开/合状态，并闩锁一段时间，避免被过渡中间态翻回去。 */
-  function requestRail(hidden) {
-    railLatchUntil = Date.now() + 520;      // 略长于 260ms 的过渡
-    if (hidden) document.body.setAttribute('data-dsh-rail-hidden', '1');
-    else document.body.removeAttribute('data-dsh-rail-hidden');
+  /**
+   * 诊断记录（`window.__dshRailDiag`）。
+   *
+   * 用户报："打开历史对话侧边栏，点右侧空白处想回对话，侧边栏莫名其妙又弹出来。"
+   *
+   * <h3>排查过程（三轮，前两轮都改错了地方，留个记录）</h3>
+   * <ol>
+   *   <li><b>第一轮</b>：判据是"祖先链里有 centerCol 才算点对话区"。
+   *       真机发现抽屉右侧常盖着**不属于 centerCol 的浮层**（提示卡），
+   *       于是判据为假 → 什么都不做 → 抽屉不收。已改成按"侧边栏右边缘之右"判定。</li>
+   *   <li><b>第二轮</b>：监听器只挂在 `document` 捕获阶段。
+   *       真机探针（tools/rail-diagnose.js）显示那个位置的元素是
+   *       **卡片里的按钮**，按钮自己 `stopPropagation` → 事件到不了 document
+   *       → 我们收不到。已加挂 `window` 捕获阶段（最先执行）。</li>
+   *   <li><b>第三轮</b>：之前为了"不依赖猜对原因"加过一个**500ms 强制保持收起**
+   *       的观察器，结果它把**用户自己再点开**也按回去了 —— 用户看到的"回弹"
+   *       其实是它造成的。已整个删除。</li>
+   * </ol>
+   * 现在这里只剩诊断记录，不再有会误伤用户操作的兜底。
+   */
+  W.__dshRailDiag = [];
+  function railDiag(what) {
+    try {
+      /*
+       * 记录调用栈（前 4 帧）。
+       * 为什么要带栈：曾经看到一条"多余的收起"却查不出是谁发起的 ——
+       * 光有时间戳和动作名，只能靠猜；带上栈就是可证的事实。
+       */
+      var st = '';
+      try {
+        var e = new Error();
+        if (e.stack) {
+          st = e.stack.split('\n').slice(2, 6)
+                .map(function (s) { return s.trim().replace(/^at\s+/, '').slice(0, 60); })
+                .join(' ← ');
+        }
+      } catch (e2) { }
+      W.__dshRailDiag.push(Date.now() + ' ' + what + (st ? '  @' + st : ''));
+      if (W.__dshRailDiag.length > 40) W.__dshRailDiag.shift();
+    } catch (e) { }
   }
 
-  /** 收起抽屉：复用 DSH 自己的「收起侧边栏」按钮。 */
+  /**
+   * 「我们正在派发自己合成的点击」标志 —— **只在 `b.click()` 那一瞬为真**。
+   *
+   * ⚠️ 声明位置必须在这一层（IIFE 体内，与 requestRail / requestRailInner 同级）。
+   * 踩过的坑：我把它挪"出去"时挪错了地方，落进了 patchWindowTapToCloseRail 内部的
+   * 匿名函数里（depth=2），而使用它的 requestRailInner 在 depth=1 ——
+   * 于是赋值时抛 `railDelegating is not defined`，被 catch 吞掉，
+   * 表现就是"点了鲸鱼抽屉滑出来但内容还是窄轨道"，且**日志里看不出是异常**。
+   * （那次之所以难查：异常信息当时也没打进诊断。）
+   *
+   * 它拦住的是"我们自己合成的那一击再次进入 click 监听器"这个环
+   * （requestRailInner → 点按钮 → HTMLDocument 监听器 → requestRailInner）。
+   * 用同步标志而不是时间窗口：合成点击同步派发，置位→click→复位 就够；
+   * 真实用户事件都在之后的事件循环里，那时标志早已复位，不会误伤。
+   */
+  var railDelegating = false;
+
+  /**
+   * 抽屉收起后，隔多久才去点 DSH 的按钮让它把内容缩成窄轨（毫秒）。
+   *
+   * <p>260ms 是滑动时长，多留 40ms 余量：必须等**滑完**再重排，
+   * 否则内层内容会在画面里跟着变 —— 那正是用户看到"两个抽屉"的样子。
+   */
+  var RAIL_FLIP_CLOSE_MS = 300;
+
+  /**
+   * 抽屉展开前，先在屏幕外把内容渲染好再滑进来所需的等待（毫秒）。
+   *
+   * <p>DSH 那一次同步重渲染实测 50–100ms（还会阻塞主线程），90ms 够它落完；
+   * 太短会滑进来一个"空的窄抽屉"，太长用户会觉得点了没反应。
+   */
+  var RAIL_FLIP_OPEN_MS = 90;
+
+  /** 上面那两个延时共用的定时器句柄（连点两下时要能取消上一次）。 */
+  var railFlipTimer = 0;
+
+  /**
+   * 请求抽屉的开/合状态。
+   *
+   * <h3>★ 第四轮（这一版）：不再自己改属性，改成"点 DSH 的按钮"</h3>
+   *
+   * 前三轮都在改 `data-dsh-rail-hidden` 这个**我们自己的**属性，然后指望
+   * DSH 跟着它走。真机时间线（tools/rail-timeline.js）证明这条路走不通：
+   *
+   * <pre>
+   * 0ms    起点 class = pI_x6G_sidebarCol
+   * 701ms  已置为收起（我们改属性）  class 仍然 = pI_x6G_sidebarCol
+   * 709ms  点了 DSH 的「打开侧边栏」
+   * 912ms  body.data-dsh-rail-hidden = null   ← 只有 DSH 的按钮会动状态
+   * 2060ms class 全程没有变过
+   * </pre>
+   *
+   * 也就是说：**DSH 的状态权威是它自己那个切换按钮，不是我们的属性**。
+   * 我们单方面改属性 → DSH 内部仍以为抽屉是开的 →
+   * 用户再点开时，DSH 把它当成"关闭"，于是抽屉纹丝不动或又被缩回去
+   * （这就是用户反复报的"回弹"）。
+   *
+   * 现在改成**委托**：请求什么状态，就去点 DSH 对应的那个按钮，
+   * 让它自己把状态和动画走完；我们的属性只由下面那个 observer 跟随它。
+   *
+   * @param hidden true=收起, false=展开
+   * @param fromUser 是否用户直接发起（用户发起时优先，不被自动同步压回）
+   */
+  function requestRail(hidden, fromUser) {
+    /*
+     * 第七轮起**不再需要任何闩锁**：状态只有 DSH 一个来源，
+     * 我们不再"压住"任何东西，也就没有需要防的中间态误判。
+     * （railLatchUntil / railExplicitShowUntil 两个变量保留仅为兼容旧引用，
+     *   代码里已不参与任何判断。）
+     */
+
+    /*
+     * ★ 重入闸门（第六轮，最后一块拼图）。
+     *
+     * 下面会去 `b.click()` 点 DSH 的按钮 —— 而那一击**同样会经过我们自己的
+     * click 监听器**（真机栈里看得很清楚：
+     *   requestRail ← HTMLDocument.<anonymous> ← requestRail ← railPointerHandler）。
+     * 于是"我们收一次 → 触发 DSH 切换 → 又被我们当成用户点击再收一次"，
+     * 一个切换动作被做了两遍，抽屉就是收了又开／开了又收 —— 用户看到的"回弹"。
+     *
+     * ⚠️ 这里**不能**用一个"执行期间为真"的开关：我们的合成点击是**同步**派发的，
+     * 而真实用户点击可能恰好排在同一段脚本里 —— 那样会把用户的点击也一起挡掉
+     * （实测：用户点空白完全没反应，因为连"收起"都被自己的闸门吃了）。
+     * 正确做法是**只在合成点击那一瞬间**放行/拦截，用时间戳标记，
+     * 监听器看到"刚刚是我们自己合成的那一击"就跳过。
+     */
+    return requestRailInner(hidden, fromUser);
+  }
+
+  /**
+   * 找 DSH 自己的抽屉切换按钮。
+   *
+   * <h3>为什么要单独抽出来、还要多路兜底</h3>
+   * 0.3.9 里 `requestRail` 找不到按钮就"静默不做事"，结果用户装了之后
+   * **侧边栏完全打不开** —— 一个查不到元素就让核心功能全废，不可接受。
+   * 所以这里：三种选择器依次试，并返回"找到了哪个"供诊断。
+   *
+   * @param hidden true 表示想要"收起"，对应按钮标签是「收起侧边栏」
+   */
+  function findRailToggle(hidden) {
+    var want = hidden ? '收起侧边栏' : '打开侧边栏';
+    var sels = [
+      '[class*="sidebarCol"] button[aria-label*="' + want + '"]',
+      '[class*="logoRow"] button[aria-label*="侧边栏"]',
+      'button[aria-label*="' + want + '"]'
+    ];
+    for (var i = 0; i < sels.length; i++) {
+      try {
+        var el = document.querySelector(sels[i]);
+        if (el) return { btn: el, via: sels[i] };
+      } catch (e) { }
+    }
+    /*
+     * 最后兜底：任意一个"侧边栏"切换按钮，**按它的标签判断语义**。
+     * 只有当它的语义与目标一致时才用（否则会把状态点反）。
+     */
+    try {
+      var all = document.querySelectorAll('button[aria-label*="侧边栏"]');
+      for (var j = 0; j < all.length; j++) {
+        var lbl = all[j].getAttribute('aria-label') || '';
+        if ((hidden && lbl.indexOf('收起') >= 0) || (!hidden && lbl.indexOf('打开') >= 0)) {
+          return { btn: all[j], via: 'any+label(' + lbl + ')' };
+        }
+      }
+    } catch (e2) { }
+    return null;
+  }
+
+  function requestRailInner(hidden, fromUser) {
+    /*
+     * ★★★ 第八轮定稿（真机逐帧实测之后）：**真相就是我们这个属性**。
+     *
+     * 第七轮我按"只留 DSH 一套状态"改成委托点击 + 按按钮标签镜像，
+     * 结果用户报"抽屉连开都开不了 / 开了关不掉"。用 tools/rail-who-moves.js
+     * 逐帧量出了铁证：
+     *
+     *   我们设 attr=1          → tx = -280   抽屉真的收起 ✅
+     *   我们清掉 attr          → tx = 0      抽屉真的展开 ✅
+     *   点 DSH 自己的切换按钮  → tx 恒为 0   抽屉**一动不动**，只有按钮标签翻转 ❌
+     *
+     * 也就是说：**抽屉的位移已经完全由我们的 CSS（认 body[data-dsh-rail-hidden]）
+     * 控制，DSH 的开合状态不再影响它**。所以第七轮那个"按按钮标签镜像"的前提是错的
+     * —— 按钮标签跟画面根本不对应，照着它写属性必然把画面写反。
+     *
+     * 现在只有一份真相：`body[data-dsh-rail-hidden]`。
+     *   · requestRail 直接写它（同步、立刻生效、可被工具单独验证）；
+     *   · 写完**顺带**把 DSH 的按钮点一下，让它的标签跟上 ——
+     *     这一步是"顺手对齐"，失败了也不影响画面（画面只认属性）。
+     *     只有"标签与目标不一致"时才点，否则会把 DSH 状态翻反。
+     */
+    var want = hidden ? '1' : '0';
+    var cur = document.body.getAttribute('data-dsh-rail-hidden');
+    if (cur === want) {
+      railDiag('requestRail(' + (hidden ? 'hide' : 'show') + ') → 已是目标状态，无动作');
+      return true;
+    }
+
+    /*
+     * ★★★ 第九轮（2026-10-21）：**滑动和"DSH 重排内容"必须错开时间**。
+     *
+     * 【用户报的现象】"收回的时候感觉有两个抽屉一样，外层的先回去了，
+     *   内层的才回去，而且动画帧数低。"
+     *
+     * 【逐帧实测（CDP 采的，别的都是猜）】
+     *   t=63ms   我们写了属性，按理这一帧就该开始滑
+     *   t=112ms  出现一个 49ms 的长帧        ← 同期 DSH 在做同步重渲染
+     *   t=161ms  抽屉才真正开始动            ← 中间 100ms 白等
+     *   t=277ms  collapsed 类翻转、内层开始重排（外层已经滑掉 90%）
+     *   t=377ms  外层滑完
+     * 也就是说：**我们点 DSH 按钮 → 它同步重渲染（阻塞主线程）→
+     * 既拖慢了滑动的起手，又让内层内容在外层快滑完时才跟着变**。
+     * 屏幕上就是"两个抽屉：外面的先回去，里面的后回去"。
+     *
+     * 【改法】把那次点击**挪出滑动窗口**：
+     *   · 收起：先滑走（这一帧只有 transform，干净），滑完再让 DSH 缩成窄轨
+     *     —— 那时它已经在屏幕外，怎么重排都看不见；
+     *   · 展开：先在屏幕外把内容展开好，再滑进来 —— 否则会滑进来一个"空的窄抽屉"
+     *     （这正是 0.4.1 那次线上事故：抽屉里只有一列图标）。
+     */
+    if (railFlipTimer) { clearTimeout(railFlipTimer); railFlipTimer = 0; }
+
+    if (hidden) {
+      // ① 唯一真相：先写属性 → 这一帧就开始滑
+      document.body.setAttribute('data-dsh-rail-hidden', '1');
+      railDiag('requestRail(hide) → 已写属性，开始滑动；DSH 同步延后 '
+               + RAIL_FLIP_CLOSE_MS + 'ms');
+      railFlipTimer = setTimeout(function () {
+        railFlipTimer = 0;
+        syncDshCollapsedNow(true);
+      }, RAIL_FLIP_CLOSE_MS);
+      return true;
+    }
+
+    /*
+     * ② 展开：先保持隐藏（attr=1），让 DSH 在**屏幕外**把完整内容渲染好，再撤属性滑进来。
+     */
+    document.body.setAttribute('data-dsh-rail-hidden', '1');
+    syncDshCollapsedNow(false);
+    railDiag('requestRail(show) → 先在屏幕外展开内容，' + RAIL_FLIP_OPEN_MS + 'ms 后滑入');
+    railFlipTimer = setTimeout(function () {
+      railFlipTimer = 0;
+      document.body.removeAttribute('data-dsh-rail-hidden');
+    }, RAIL_FLIP_OPEN_MS);
+    return true;
+  }
+
+  /**
+   * 让 DSH 自己也走到目标状态（它会重排内容：窄轨道 ↔ 完整抽屉）。
+   *
+   * <p>为什么必须做这一步：位移是我们 CSS 管的，但**内容由 DSH 渲染** ——
+   * 它靠内部类名 {@code collapsed} 决定渲染窄轨道还是完整抽屉。
+   * 只写我们的属性只会滑动，DSH 仍带 {@code collapsed}，于是滑出一个只有一列图标的
+   * "大抽屉"（0.4.1 的线上事故，见下面的长注释）。
+   *
+   * <p>为什么抽成函数：时间和滑动**错开**由调用方决定（见上面 requestRailInner 的说明）。
+   *
+   * @param hidden true 表示希望 DSH 处于收起（collapsed）状态
+   */
+  function syncDshCollapsedNow(hidden) {
+    /*
+     * ★★★ ② 让 **DSH 也走到同一状态** —— 这一步不是"顺手对齐"，是**必须的**。
+     *
+     * 【本次线上报障的根因】用户点浮动鲸鱼，抽屉滑出来了，但**里面只有一列图标**
+     * （会话列表没有，`treeitem` 数 = 0），看起来就是"大抽屉/空抽屉"。
+     *
+     * 原因：我们把抽屉的**位移**交给自己的 CSS（认 body[data-dsh-rail-hidden]），
+     * 但**内容由 DSH 渲染** —— 它靠内部类名 `hHd-Xa_collapsed` 决定渲染"窄轨道"还是"完整抽屉"。
+     * 只写我们的属性只会滑动，DSH 仍带 `collapsed`，于是渲染窄轨道。
+     *
+     * 逐帧实测（tools/rail-collapsed-probe.js）证据：
+     *   起点(收起)   collapsed类=root collapsed quietBars   attr=1  会话项=0
+     *   点DSH按钮+200ms  collapsed类=root quietBars          attr=   会话项=6  ← 内容出来了
+     *
+     * 所以必须点它自己的切换按钮，把 `collapsed` 摘掉/加回。
+     *
+     * ⚠️ 上一轮我删掉过这一步，因为"每次都把状态翻反"。真正的原因是：
+     *   · 我用 `findRailToggle(!hidden)` 找按钮，语义正好相反；
+     *   · 而且按钮标签与画面不同步，按标签判方向必然出错。
+     * 现在改成**按当前类名判方向**：只有"DSH 的状态与目标不符"时才点，
+     * 且找按钮时**不看标签**（那玩意不可靠），取 DOM 里那颗切换按钮即可。
+     *
+     * 用 railDelegating 包住这一击：它会再次进入我们自己的 click 监听器，
+     * 不拦住就会翻两次（历史踩过）。点击是同步的，标志在事件循环内复位，
+     * 真实用户事件不会被误伤。
+     */
+    try {
+      /*
+       * ⚠️ 选择器**必须限定在侧边栏内**（`[class*="sidebarCol"] ` 前缀）。
+       *
+       * 踩过的坑：原来写的是 `document.querySelector('[class*="hHd-Xa_root"]')`，
+       * 而**我们注入的浮动鲸鱼按钮内部也带这个类**（复用了 DSH 侧边栏的图标 HTML）。
+       * 冷启动时侧边栏还没渲染，于是选到了浮按钮里那个 —— 它**不含 collapsed**，
+       * 于是读到 dshCollapsed=false → 判定"无需翻转" → **DSH 永远停在收起**，
+       * 抽屉滑出来了但内容只有一列图标（用户看到的"大抽屉/空抽屉"）。
+       *
+       * 这个 bug 之所以难查：读错了元素却**不报错**，只是静默不动作。
+       * 所以下面每一步都留痕，catch 里也留痕（不再吞异常）。
+       */
+      var rootEl = document.querySelector('[class*="sidebarCol"] [class*="hHd-Xa_root"]');
+      var dshCollapsed = !!(rootEl && rootEl.className.indexOf('collapsed') >= 0);
+      /* 我们要收起 → DSH 应当处于 collapsed；要展开 → 不应处于 collapsed */
+      var needFlip = (hidden !== dshCollapsed);
+      railDiag('  ↳ DSH同步检查: rootEl=' + (rootEl ? 'ok' : 'null')
+               + ' dshCollapsed=' + dshCollapsed + ' 目标hidden=' + hidden
+               + ' needFlip=' + needFlip);
+      if (needFlip) {
+        var tog = (rootEl && rootEl.querySelector('button[aria-label*="侧边栏"]'))
+               || document.querySelector('[class*="sidebarCol"] button[aria-label*="侧边栏"]')
+               || document.querySelector('button[aria-label*="侧边栏"]');
+        railDiag('  ↳ 找到切换按钮: ' + (tog ? ((tog.getAttribute('aria-label') || tog.tagName)) : 'null'));
+        if (tog) {
+          var prevD = railDelegating;
+          railDelegating = true;
+          try { tog.click(); } finally { railDelegating = prevD; }
+          railDiag('  ↳ 已同步 DSH 内容状态（' + (hidden ? '收起' : '展开') + '）');
+        } else {
+          railDiag('  ↳ 找不到 DSH 切换按钮，内容状态未同步');
+        }
+      } else {
+        railDiag('  ↳ DSH 内容状态已一致，无需翻转');
+      }
+    } catch (e) {
+      railDiag('  ↳ DSH同步异常: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  /**
+   * 收起抽屉。
+   *
+   * <p>⚠️ 2026-10-21 改为**直接走 requestRail**，不再去点 DSH 的「收起侧边栏」按钮。
+   *
+   * <p>以前点那个按钮是为了"让 DSH 自己把内容状态也切过去"。问题是它会**立刻**
+   * 重排内容（React 同步渲染 50–100ms），而我们的滑动是 260ms —— 两条动画叠在一起，
+   * 用户看到的就是"两个抽屉：外层先回、内层后回"。现在 requestRail 会先滑完
+   * 再同步 DSH 的状态（那时抽屉已在屏幕外，重排看不见）。
+   */
   function collapseRail() {
-    var b = document.querySelector('[class*="sidebarCol"] button[aria-label*="收起侧边栏"]');
-    if (b) { b.click(); return true; }
-    return false;
+    return requestRail(true, false);
   }
 
   /**
@@ -754,6 +1217,8 @@
     if (W.__dshDrawerAutoClose) return;
     W.__dshDrawerAutoClose = true;
     document.addEventListener('click', function (ev) {
+      // 我们自己派发的那一击（requestRail 去点 DSH 按钮）—— 不算用户操作
+      if (railDelegating) return;
       var t = ev.target;
       if (!t || !t.closest) return;
       /*
@@ -764,14 +1229,11 @@
       if (W.__dshHoldDrawer) return;
 
       /*
-       * 抽屉里的「收起侧边栏」：**立刻**切到收起态。
-       * 同上，不能等 MutationObserver 的 150ms 去抖，否则点一下要顿一下才动。
-       * 用精确匹配，避免误伤「收起右侧边栏」。
+       * 说明：侧边栏切换按钮（打开/收起侧边栏）的接管**不在这里** ——
+       * 因为 railTapHandler 里那条"抽屉里的点击直接 return"更早执行，
+       * 写在这里永远不会被调用（踩过）。它现在位于 railTapHandler 内部、
+       * 在那条 return **之前**，见那里的注释。
        */
-      if (t.closest('[class*="sidebarCol"] button[aria-label="收起侧边栏"]')) {
-        requestRail(true);
-        return;
-      }
 
       var side = t.closest('[class*="sidebarCol"]');
       if (!side) return;
@@ -815,11 +1277,362 @@
        * 用户明确要求这里要把抽屉收起来。
        */
       var isAddWorkspace = !!t.closest('button[aria-label="添加工作区"]');
-      if (!isSessionRow && !isNewSession && !isAddWorkspace && !isPanelRow) return;
+      /*
+       * 抽屉顶部那一排"点了就会把中间栏换成别的东西"的入口 —— 点了都该收起来，
+       * 否则抽屉就盖在新页面上（插件页那次事故就是这么发现的：抽屉挡住了
+       * 「添加插件」按钮）。
+       *
+       * ★ 2026-10-21 用户报「打开自动化任务后抽屉不会自动回去」：
+       * 下面这张表原先只有「新建会话 / 插件 / 添加工作区」，漏了「自动化任务」。
+       * 用 aria-label **精确匹配**（实测这几个按钮都带 aria-label，见 CDP 抓的
+       * 抽屉按钮清单：新建会话 / 插件 / 自动化任务 / 添加工作区 / 搜索会话 / 账号菜单）。
+       * 「账号菜单」故意不在表里 —— 它只弹一个菜单，页面没变，抽屉该留着。
+       */
+      var navLabels = ['自动化任务', '搜索会话'];
+      var isNavRow = false;
+      for (var ni = 0; ni < navLabels.length; ni++) {
+        if (t.closest('button[aria-label="' + navLabels[ni] + '"]')) { isNavRow = true; break; }
+      }
+      if (!isSessionRow && !isNewSession && !isAddWorkspace && !isPanelRow && !isNavRow) return;
 
       // 先让 DSH 完成切换/开弹窗，再收起抽屉
       setTimeout(collapseRail, 80);
     }, true);
+  }
+
+  /**
+   * 抽屉打开时，点右边那块"对话区"也要能收起来 —— 用户要的是"点回去就回原会话"。
+   *
+   * <h3>为什么需要它</h3>
+   * patchDrawerAutoClose 只认**抽屉内部**的点击（选会话/新建会话）。用户的手势是
+   * "划出会话列表看一眼，然后直接点右边那块对话区想回去"，而那块区域点下去
+   * 什么都不会发生，看起来就是"点了没反应、退不回原来的会话"。
+   * 用户原话："调出会话列表后点击右侧会话区域无法回退至原会话"。
+   *
+   * <h3>为什么只认 centerCol</h3>
+   * `[class*="centerCol"]` 是中间栏（对话正文），它是"右边那块"最稳的锚点：
+   *   · 抽屉在 sidebarCol 里，点它不会命中 centerCol；
+   *   · 鲸鱼按钮、右侧栏都在 centerCol 之外，所以不会被误伤；
+   *   · 平板上 centerCol 常驻可见（没有抽屉这回事），所以本函数**只在窄屏 + 抽屉打开时**生效。
+   *
+   * <h3>⚠️ "抽屉开着"的判据（这里栽过一次，别再写反）</h3>
+   * `body[data-dsh-rail-hidden]` = **抽屉已经收起**（名字就是"轨道被藏起来"）。
+   * 第一版把它当成"抽屉开着"，于是 `if (!hasAttribute(...)) return;` 在正常情况下
+   * 直接返回 —— 真机 CDP 实测点下去毫无反应，而代码看起来完全"合理"。
+   *
+   * <h3>为什么不能只看宽度</h3>
+   * 真机实测（360dp 宽、抽屉 280dp）：抽屉**收起后 `sidebarCol` 的宽度仍然是 280** ——
+   * 它是靠 `translateX(-280)` 移出屏幕的（点开后 `getBoundingClientRect().x` 从
+   * -280 变 0）。所以"宽度 ≥ 200 就算开着"会把收起态误判成打开，
+   * 于是点侧边栏反而把抽屉**拉开** —— 比不修还糟。
+   * 现在改成：① 用户动作后的闩锁期用我们自己的状态；② 闩锁到期后用
+   * `elementFromPoint` 直接看"抽屉原来占的那块位置"露出来的是谁 —— 这是几何事实，
+   * 不依赖任何类名或宽度假设。
+   *
+   * <h3>为什么不用遮罩</h3>
+   * 加一层半透明遮罩 + 点击关闭是最常见的写法，但这里行不通：抽屉下的内容
+   * 仍然要能被 DSH 自己正常收到事件（比如点会话行切换），遮罩会把它们吃掉。
+   * 事件委托不改 DOM 结构，风险最小 —— 宁可少改，也不要加不可靠的判断逻辑。
+   */
+  function drawerOpen() {
+    var side = document.querySelector('[class*="sidebarCol"]');
+    if (!side) return false;
+    /*
+     * ★ 唯一真相：这个属性。
+     *
+     * 逐帧实测（tools/rail-who-moves.js）确认：
+     *   设 attr=1 → tx=-280（真收起）；清掉 → tx=0（真展开）；
+     *   而点 DSH 自己的按钮 20 次，tx 恒为 0 —— 它的状态**不驱动画面**。
+     * 所以画面状态只能由这个属性表达，别再去读 DSH 的按钮标签。
+     */
+    return !document.body.hasAttribute('data-dsh-rail-hidden');
+  }
+
+  function patchWindowTapToCloseRail() {
+    if (W.__dshTapCloseRail) return;
+    W.__dshTapCloseRail = true;
+
+    /*
+     * ★ 点击取证日志（`window.__dshClickLog`）。
+     *
+     * 用户反馈"点侧边栏的关闭按钮关不掉"。我无法看到他的屏幕，
+     * 而他点的到底是哪个元素（DSH 的切换按钮？注入的鲸鱼按钮？某个插件按钮？）
+     * 直接决定该改哪里。之前只能靠猜，代价是改了五轮都没中。
+     *
+     * 所以这里把所有点击记下来（最多 30 条）：点到了谁、坐标、当时抽屉是开是关、
+     * 以及那一击有没有被当作"收抽屉"处理。出问题时报一条命令就能看现场：
+     *   node tools/cdp.mjs --file tools/rail-clicklog.js
+     */
+    if (!W.__dshClickLog) {
+      W.__dshClickLog = [];
+      W.addEventListener('click', function (ev) {
+        try {
+          var t = ev.target;
+          var el = t && t.closest ? (t.closest('button,[role="button"],a') || t) : t;
+          var lbl = el && el.getAttribute ? (el.getAttribute('aria-label') || '') : '';
+          W.__dshClickLog.push({
+            t: Date.now() % 1000000,
+            tag: el ? el.tagName : '',
+            id: el ? (el.id || '') : '',
+            cls: el ? (el.className || '').toString().slice(0, 34) : '',
+            aria: lbl.slice(0, 24),
+            x: Math.round(ev.clientX), y: Math.round(ev.clientY),
+            inSide: !!(t && t.closest && t.closest('[class*="sidebarCol"]')),
+            railHidden: document.body.getAttribute('data-dsh-rail-hidden') === '1',
+          });
+          if (W.__dshClickLog.length > 30) W.__dshClickLog.shift();
+        } catch (e) { }
+      }, true);
+    }
+    /**
+     * 「刚刚点过抽屉切换按钮」的冷却时间。
+     *
+     * 起因（真机时间线实测）：我们收起抽屉是**直接改 body 属性**，
+     * 而 DSH 的按钮状态是它自己那边维护的 —— 两者的内部状态**不会自动对齐**。
+     * 于是"收起后马上再点开"时，DSH 仍以为抽屉是开的，
+     * 那一下点击被它当成"关闭"处理，用户看到的就是"点了不弹出来 / 回弹"。
+     *
+     * 这个冷却只做一件事：**极短时间内不重复转发**同一次连点，
+     * 避免和 DSH 正在跑的过渡打架。真正的状态权威仍然交给 DSH 自己。
+     */
+    var railToggleCooldownUntil = 0;
+
+    /**
+     * 最近一次"收起抽屉"动作的时间戳 —— 用来给 click 与 pointerup 去重。
+     *
+     * 同一次触摸会先来 pointerup、再来 click（或反之，取决于浏览器是否把 click 抑制掉），
+     * 两个监听器都会尝试收一次；不去重就会收两次，
+     * 加上"收起"会委托点击 DSH 的按钮（这是个**切换**），第二次就把抽屉又打开了
+     * —— 现象正是用户反复报的"回弹"。
+     */
+    var railLastTapAt = 0;
+
+  /**
+   * 「我们正在派发自己合成的点击」标志 —— **只在 `b.click()` 那一瞬为真**。
+   *
+   * <h3>为什么必须是同步的一瞬，而不是一段时间窗口</h3>
+   * requestRail 会去点 DSH 的按钮，而那一击**会再次进入我们自己的 click 监听器**
+   * （带调用栈的 __dshRailDiag 抓到的环：
+   *   requestRailInner → 点按钮 → HTMLDocument 监听器 → requestRailInner → …）。
+   * 不拦住就会把一次切换做成两次，用户感受就是**点按钮关不掉抽屉**。
+   *
+   * 但拦的窗口**不能是一段时间**（时间戳版本踩过：紧随其后的真实 pointerup
+   * 落进 60ms 窗口被忽略，点空白完全没反应）。我们的合成点击是**同步派发**的，
+   * 所以只要在 `click()` 前后置位/清位即可 —— 真实事件都在之后的事件循环里，
+   * 那时标志早已复位，绝不会被误伤。
+   */
+
+  /**
+   * 「这个点击事件已经处理过」—— 用**事件对象引用**去重。
+   *
+   * 见 railTapHandler 的说明：handler 同时挂在 window 与 document 捕获阶段，
+   * 一次点击会进来两次，两次判定基准不同会互相抵消。
+   *
+   * 为什么不用 ev.timeStamp：合成点击会复用同一个时间戳，
+   * 导致后续点击被误判成"已处理"而完全失效（实测踩到）。
+   * 同一次派发传给两个监听器的是同一个事件对象 —— 引用比对才可靠。
+   */
+  var railHandledEv = null;
+    /*
+     * ★ 为什么在 window 和 document 上**都挂**（且都用捕获阶段）：
+     *
+     * window 的捕获阶段是整条传播链的**最外层、最先执行**的位置。
+     * 真机实测（tools/rail-diagnose.js 的探针）：抽屉右侧那块经常盖着
+     * 卡片里的按钮（例如提示卡上的主按钮），按钮自己的处理里调了 stopPropagation ——
+     * 于是事件**冒泡不到 document**，我们挂在 document 上的监听器收不到，
+     * 表现就是"点空白回不去 / 点了没反应"。
+     * 挂到 window 捕获阶段就不受它影响（我们最先跑）。
+     *
+     * 同一次点击会被这两个监听器各调用一次，但 handler 是幂等的：
+     * 第一次就已把抽屉收起并 stopImmediatePropagation，
+     * 第二次进来时 drawerOpen() 已经为假，直接返回。
+     */
+    function railTapHandler(ev) {
+      // 我们自己派发的那一击（requestRail 去点 DSH 按钮产生的）—— 不能再当用户点击处理
+      if (railDelegating) return;
+      /*
+       * ★★★ 去重：同一次派发只处理一次。
+       *
+       * 这是"关不掉"的**真正根因之一**（找了很久）：
+       * 这个 handler 同时挂在 `window` 和 `document` 的捕获阶段，
+       * 于是**一次点击会进来两次**。两次都会重新算 `wantHide = drawerOpen()` ——
+       * 第一次算"收起"并执行，第二次基于**变化后**的状态算成"展开"，正好抵消。
+       *
+       * ⚠️ 不能用 `ev.timeStamp` 当指纹：实测合成点击（el.click()）会**复用同一个
+       * 时间戳**，于是第 2 次起的点击全被误判成"已处理"，处理器再也不跑
+       * （现象：点一次有效，之后完全没反应，railDiag 也不再增长）。
+       * 改用**引用比对**：同一次派发传给两个监听器的是**同一个事件对象**，
+       * 引用相同即同一次；不同点击的事件对象必然不同。
+       */
+      if (ev === railHandledEv) return;
+      railHandledEv = ev;
+      // 编排抽屉期间（插件页返回那条路）不许收 —— 否则一开一合太乱
+      if (W.__dshHoldDrawer) return;
+      if (window.innerWidth >= NARROW_PX) return;   // 平板没有抽屉
+      var t = ev.target;
+      if (!t || !t.closest) return;
+
+      /*
+       * ★★★ 第一优先：侧边栏切换按钮的接管。
+       *
+       * 这里**必须在下面那条 `if (!drawerOpen()) return;` 之前** ——
+       * 那条守卫是给"点空白收起"用的（"抽屉本来就是收起的，没什么可收"），
+       * 但它会把**抽屉收起时点切换按钮**也一并挡掉，于是永远打不开。
+       * 实测（tools/rail-guard-trace.js）逐条复刻守卫链才定位到：
+       *   drawerOpen=False → 直接 return，接管代码根本没机会执行。
+       * 这个顺序错误我先后踩了两次（另一次是把它写在 patchDrawerAutoClose 里），
+       * 所以现在把它放在**所有守卫之后的第一件事**。
+       *
+       * 为什么必须接管：取证日志（window.__dshClickLog）显示用户点的"关闭按钮"是
+       *   BUTTON.hHd-Xa_iconButton.hHd-Xa_toggle
+       * 它被我们自己的 CSS 弄成 [0,0,0,0]（收起时）或 28x28（展开时），
+       * 而且 **DSH 的状态不驱动画面**（逐帧实测点它 20 次 tx 都是 0）——
+       * 点它什么都不会发生，这就是"打不开 / 关不掉"。
+       */
+      var railToggle = t.closest('[class*="sidebarCol"] button[aria-label*="侧边栏"]');
+      if (railToggle) {
+        var rl = railToggle.getAttribute('aria-label') || '';
+        /*
+         * 开关语义：**当前开着 → 这一击应当收起**，即 wantHide = drawerOpen()。
+         * ⚠️ 这里我写错过一次（写成 !drawerOpen()），现象是"点关闭反而想展开"，
+         * 抽屉纹丝不动。布尔值写反靠读代码很容易漏，所以保留打出方向的诊断。
+         */
+        var wantHide = drawerOpen();
+        railDiag('侧边栏切换按钮被点: aria=' + rl + ' → ' + (wantHide ? '收起' : '展开'));
+        requestRail(wantHide, true);
+        /*
+         * ★ 必须把这一击**吃掉**（2026-10-21）。
+         *
+         * 以前这里直接 return，事件继续传给 DSH —— 它的 onClick 立刻把侧边栏切成
+         * `collapsed`，于是内容**在我们滑动的同时**重排：实测 collapsed 在 t=271ms
+         * 翻转，而外层此刻才滑掉 90%，看起来就是"里面的抽屉后回去"。
+         * 现在滑动的时序由 requestRail 统一安排（先滑完、再同步 DSH 内容），
+         * DSH 自己那一次必须挡掉，否则又变回两套动画。
+         */
+        ev.stopImmediatePropagation();
+        ev.stopPropagation();
+        return;
+      }
+
+      // 以下是"点空白收起"的路径：抽屉本来就是收起的话没什么可收
+      if (!drawerOpen()) return;
+
+      /*
+       * 说明：侧边栏切换按钮的接管已经**提到所有守卫之前**（见本函数上方），
+       * 那里是有注释说明的正式位置。这里保持"其余抽屉内点击交给
+       * patchDrawerAutoClose 判"的原逻辑即可。
+       */
+
+      // 抽屉里的其它点击交给 patchDrawerAutoClose 判（它有"点会话行才收"的细分规则）
+      if (t.closest('[class*="sidebarCol"]')) return;
+      // 兜底：从抽屉里长按/拖出去的浮层也不该被动到
+      if (t.closest('[role="dialog"]')) return;
+
+      /*
+       * ★ 判据是"**点在侧边栏右侧那块可见区域**"，不是"祖先链里有 centerCol"。
+       *
+       * 这一条是真实触摸测出来的（改之前用假事件测，一直测不出来）：
+       * 屏幕上经常盖着**不属于 centerCol 的浮层** —— 例如底部那张提示卡
+       * （`uV2eYG_card`，祖先链是 root/row/card，压根没有 centerCol）。
+       * 用户在它上面点一下，旧的判据判定"这不是对话区"，于是**什么都不做**，
+       * 抽屉就一直开着 —— 用户看到的就是"点空白处回不去／像又弹回来了"。
+       *
+       * 新判据只要求两件事，都不依赖 DOM 结构：
+       *   · 抽屉开着（上面已判）；
+       *   · 点落在侧边栏**右边缘之右**、且在当前视口内。
+       * 结构怎么嵌套、上面盖着什么，都不影响 —— 这正是我们要的"点对话区就收"。
+       */
+      var side = document.querySelector('[class*="sidebarCol"]');
+      if (!side) return;
+      var sr = side.getBoundingClientRect();
+      /*
+       * 用"坐标"判定，但**两个层次都试**：
+       *
+       *   ① 真实触摸：ev.clientX/Y 是准的 → 直接按"在侧边栏右边缘之右"判；
+       *   ② 合成事件/工具注入：有些途径（例如 CDP 的 Input.dispatchTouchEvent
+       *      之外的手工构造）会给出 0,0 坐标，此时**退回 DOM 判据**
+       *      （祖先链里有 centerCol 就算点在对话区）。
+       *
+       * 为什么要留 ②：真机排查时我一度用 0,0 的合成点击做验证，
+       * 结果因为坐标是 0 而被坐标判据排除，误判成"监听器没挂上"，
+       * 白查了一轮。两个层次都判之后，任何注入方式都能得到一致结果。
+       */
+      var byCoord = (ev.clientX > sr.right + 2)
+                 && ev.clientY >= 0 && ev.clientY <= window.innerHeight
+                 && ev.clientX >= 0 && ev.clientX <= window.innerWidth;
+      var byDom = false;
+      if (!byCoord && ev.clientX === 0 && ev.clientY === 0) {
+        byDom = !!(t.closest('[class*="centerCol"]'));
+      }
+      if (!byCoord && !byDom) return;      // 落在抽屉里（或边界上）→ 不碰
+
+      /*
+       * 【为什么必须 stopPropagation —— 用户报的"侧边栏莫名弹回来"】
+       *
+       * 这段监听器挂在**捕获阶段**（第三个参数 true），比 DSH 自己的 click 处理**先**跑。
+       * 第一版只调了 requestRail(true) 就放事件继续往下传，于是 DSH 的处理器随后跑，
+       * 它看到"抽屉此刻是收起的"就把这次点击当成"切换抽屉" → **又把它打开**。
+       * 用户看到的现象就是：点右侧空白处想回对话，结果侧边栏弹出来。
+       *
+       * 修法：这次点击的语义已经被我们消费掉（"点空白处 = 收抽屉"），
+       * 就别再让它进入 DSH 的处理链。stopImmediatePropagation 连同一元素上
+       * 其它监听器一起挡住。
+       *
+       * 注意**不用 preventDefault** —— 收抽屉不该改变 DSH 对这次点击的默认行为
+       * （输入框失焦、取消文本选择这些），阻止它反而会出现"点了没反应"。
+       */
+      /*
+       * 收起抽屉 —— 交给 requestRail，它现在会去点 DSH 自己的按钮，
+       * 让"状态权威"只有 DSH 一个（见 requestRail 的第四轮说明）。
+       * 这里**不要**再自己改属性或再点一次按钮，否则会点两次把状态翻过去。
+       */
+      if (Date.now() - railLastTapAt < 450) {
+        // 同一次触摸的 pointerup 已经收过了 —— 再来一次会把抽屉又切换回来
+        ev.stopImmediatePropagation();
+        ev.stopPropagation();
+        return;
+      }
+      railLastTapAt = Date.now();
+      requestRail(true, true);
+      ev.stopImmediatePropagation();
+      ev.stopPropagation();
+    }
+
+    /*
+     * ★ pointerup 兜底：真机实测发现，抽屉右侧那块如果落在一个**按钮**上
+     * （探针里是卡片内的 `BUTTON.uV2eYG_primary`），那次触摸**根本不产生 click** ——
+     * 按钮的处理把 click 抑制掉了。于是挂在 click 上的监听器（无论冒泡还是捕获）
+     * 都收不到，用户感受就是"点了没反应"。
+     *
+     * pointerup 不会被这样抑制，用它兜底最稳。
+     *
+     * ⚠️ 但 pointerup 与 click 是**同一次触摸的两个事件**，必须防止同一次被处理两遍：
+     * 真机诊断（带调用栈的 __dshRailDiag）抓到过这样的序列 ——
+     * click 先把抽屉收起，紧接着同一次触摸的 pointerup 又来一次，
+     * 于是"收起→又收起"或"展开→又被收起"，看上去就是回弹。
+     * 下面用 railLastTapAt 做去重：一次触摸只认第一个到达的事件。
+     */
+    function railPointerHandler(ev) {
+      if (railDelegating) return;                     // 我们自己派发的那一击
+      if (W.__dshHoldDrawer) return;
+      if (window.innerWidth >= NARROW_PX) return;
+      if (Date.now() - railLastTapAt < 450) return;   // 同一次触摸的另一个事件，忽略
+      if (!drawerOpen()) return;
+      var t2 = ev.target;
+      if (t2 && t2.closest && t2.closest('[class*="sidebarCol"]')) return;
+      if (t2 && t2.closest && t2.closest('[role="dialog"]')) return;
+      var s2 = document.querySelector('[class*="sidebarCol"]');
+      if (!s2) return;
+      if (ev.clientX <= s2.getBoundingClientRect().right + 2) return;
+      if (ev.clientY < 0 || ev.clientY > window.innerHeight) return;
+      railLastTapAt = Date.now();
+      requestRail(true, true);
+    }
+
+    // window 捕获（最先执行，扛得住内层 stopPropagation）+ document 捕获（兜底）
+    W.addEventListener('click', railTapHandler, true);
+    document.addEventListener('click', railTapHandler, true);
+    W.addEventListener('pointerup', railPointerHandler, true);
   }
 
   /*
@@ -1013,6 +1826,7 @@
 
   /** 驱动 DSH 原生的"编辑路径 → 回车 → 打开"流程，跳到指定目录。 */
   function choosePath(path) {
+    rememberPickedFolder(path);      // 侧边栏工作区名要用它
     var edit = document.querySelector('button[aria-label="编辑路径"]');
     if (edit) edit.click();
     var tries = 0;
@@ -1244,6 +2058,452 @@
     setTimeout(function () { pending = false; apply(); }, 150);
   }
 
+  /*
+   * ── 下载宿主：blob → base64 → 安卓落盘 ──────────────────────────
+   *
+   * 为什么需要：WebView 里的 <a download> 与 blob: URL **都没有宿主处理** ——
+   * 本工程从来没有 setDownloadListener / DownloadManager，
+   * 所以点「下载 Session 日志」只会提示"正在下载"，然后什么都不会发生。
+   *
+   * blob 的字节只活在页面内存里，安卓侧拿不到，只能由页面读成 base64 交过去。
+   * 所以在**点击阶段**接管：拿到 href（blob:）→ fetch 成 ArrayBuffer →
+   * base64 → DshAndroid.saveFile(name, b64)。
+   *
+   * 幂等：W.__dshDownloadPatched。
+   */
+    /*
+   * ══════════════ 主题上报（原生页"跟随 DSH"） ══════════════
+   *
+   * 用户要求 App 的原生页（手机权限 / 插件市场 / 悬浮球设置…）跟着 **DSH 的主题**走，
+   * 不是跟着系统走。原生侧读不到 WebView 里的主题设置，只能由这边探测再推过去。
+   *
+   * 探测分两步，先准后兜底：
+   *   ① 看 <html>/<body> 上有没有 light / dark 的类名或 data-theme —— 准，但 DSH 未必挂；
+   *   ② 兜底：**从 body 往上找第一个真正不透明的背景色**，按亮度判深浅。
+   *      不能只看 body —— 它的 background 常常是 transparent，解析出 rgba(0,0,0,0)
+   *      会被误判成深色（我第一版就栽在这，浅色主题下原生页依旧是黑的）。
+   */
+  function themeBgLuminance(el) {
+    for (var i = 0; i < 12 && el; i++) {
+      var bg = '';
+      try { bg = getComputedStyle(el).backgroundColor || ''; } catch (e) { bg = ''; }
+      var m = bg.match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+))?/);
+      if (m) {
+        var a = (m[4] === undefined) ? 1 : parseFloat(m[4]);
+        if (a > 0.5) {                       // 透明的不算，继续往上找
+          return (0.299 * (+m[1]) + 0.587 * (+m[2]) + 0.114 * (+m[3])) / 255;
+        }
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  function detectDshTheme() {
+    try {
+      var h = document.documentElement, b = document.body;
+      var mark = [
+        h ? h.className : '', h ? (h.getAttribute('data-theme') || '') : '',
+        b ? b.className : '', b ? (b.getAttribute('data-theme') || '') : ''
+      ].join(' ').toLowerCase();
+      if (/\blight\b/.test(mark) && !/\bdark\b/.test(mark)) return 'light';
+      if (/\bdark\b/.test(mark) && !/\blight\b/.test(mark)) return 'dark';
+      var lum = themeBgLuminance(b || h);
+      if (lum === null) return null;
+      return lum > 0.5 ? 'light' : 'dark';
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /*
+   * 临时探测：把侧边栏「工作区节点」的 DOM 细节打到 console.error（onConsoleMessage
+   * 只转发 ERROR/WARNING，所以必须用 error 才进得了 logcat）。
+   *
+   * 为什么要探：用户要求侧边栏显示**手机上那个文件夹的真名**，而不是 DSH 给的 "root"。
+   * 得先知道 DSH 把"工作区名字"和"工作区路径"分别放在哪（文本节点？title？aria-label？
+   * data-row-key？），否则只能靠猜。
+   */
+  function dumpWorkspaceNodes() {
+    try {
+      var lines = [];
+      var all = document.querySelectorAll('[class*="sidebarCol"] [role="treeitem"][aria-expanded]');
+      lines.push('workspace-nodes=' + all.length);
+      for (var i = 0; i < all.length && i < 8; i++) {
+        var n = all[i];
+        lines.push('--- #' + i + ' ---');
+        lines.push('text=' + (n.textContent || '').trim().slice(0, 60));
+        lines.push('title=' + (n.getAttribute('title') || ''));
+        lines.push('aria=' + (n.getAttribute('aria-label') || ''));
+        lines.push('key=' + (n.getAttribute('data-row-key') || ''));
+        lines.push('parentTitle=' + ((n.parentElement && n.parentElement.getAttribute('title')) || ''));
+        lines.push('html=' + (n.outerHTML || '').slice(0, 900));
+      }
+      var inp = document.querySelector('input[type="text"]');
+      lines.push('inputValue=' + (inp ? (inp.value || '') : '(none)'));
+      lines.push('inputAria=' + (inp ? (inp.getAttribute('aria-label') || '') : ''));
+      lines.push('url=' + location.href);
+      var text = lines.join('\\n');
+      /*
+       * 走 saveFile 桥落盘到 /sdcard/Download/Tdsh/wsdump.txt —— logcat 那条路
+       * 实测收不到页面 console（WebChromeClient 的转发没进 logcat），文件最稳。
+       * 中文必须先 encodeURIComponent 再 btoa，否则 btoa 直接抛 InvalidCharacterError。
+       */
+      if (window.DshAndroid && window.DshAndroid.saveFile) {
+        window.DshAndroid.saveFile('wsdump.txt',
+          btoa(unescape(encodeURIComponent(text))));
+      }
+    } catch (e) {
+      try {
+        if (window.DshAndroid && window.DshAndroid.saveFile) {
+          window.DshAndroid.saveFile('wsdump-err.txt', btoa('err: ' + e));
+        }
+      } catch (e2) { }
+    }
+  }
+
+  /*
+   * ══════════ 工作区名 = 手机上的文件夹真名 ══════════
+   *
+   * 用户的要求：界面上那个「root」要显示成**他选的那个手机文件夹的名字**。
+   * （对话页顶部的芯片、左侧抽屉里的分组，两处都是同一个名字。）
+   *
+   * 为什么 DOM 里拿不到：把工作区节点的 outerHTML 抓下来看过，长这样 ——
+   *   <div class="…_projectRow" data-row-key="workspace:53ad8457-f464-…"
+   *        role="treeitem" aria-expanded="true">…图标… root</div>
+   * 键是**工作区 UUID**，整棵 DOM 里没有任何路径。
+   *
+   * 为什么真名是 dsh 而不是 root：容器里那个工作区路径是 `/root`，
+   * 而它其实是把手机的 /sdcard/dsh 挂进去的 —— DSH 只是照实显示**容器路径的末段**。
+   * 所以由原生通过 DshAndroid.workspaceName() 把手机侧真名告诉网页。
+   */
+  var WS_NAME_KEY = 'dsh_ws_real_name';
+  var WS_NAME_CACHE = null;
+
+  /** 取手机侧工作区文件夹名（走原生桥，拿不到就返回 null）。 */
+  function realWorkspaceName() {
+    if (WS_NAME_CACHE) return WS_NAME_CACHE;
+    try {
+      if (window.DshAndroid && window.DshAndroid.workspaceName) {
+        var n = window.DshAndroid.workspaceName();
+        if (n) { WS_NAME_CACHE = String(n); return WS_NAME_CACHE; }
+      }
+    } catch (e) { }
+    // 兜底：用户在我们选择器里点"选择此目录"时记下来的那一层名字
+    try { return localStorage.getItem('dsh_ws_picked_name'); } catch (e) { return null; }
+  }
+
+  /** 在 choosePath 里调用：记住用户选的这个文件夹叫什么（桥返回空时的兜底）。 */
+  function rememberPickedFolder(path) {
+    try {
+      var p = String(path || '').replace(/\/+$/, '');
+      var name = p.split('/').pop();
+      if (name) localStorage.setItem('dsh_ws_picked_name', name);
+    } catch (e) { }
+  }
+
+  /**
+   * 把一个元素里的**纯文本节点**换成新名字（不碰图标/角标）。
+   *
+   * ⚠️ 必须**递归**找文本节点。第一版只扫直接子节点，结果对话页那个芯片纹丝不动 ——
+   * DSH 的结构是 <button><span>图标</span><span>root</span><svg/></button>，
+   * "root" 是**孙节点**里的文本，扫一层根本找不到（而且 button.textContent 恰好是
+   * "root"，条件判断会通过，于是静默失败，最难查）。
+   */
+  function rewriteText(el, want) {
+    if (!el) return false;
+    var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+    var nd;
+    while ((nd = walker.nextNode())) {
+      if ((nd.nodeValue || '').trim() === 'root') {
+        nd.nodeValue = want;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 全量扫一遍：把「root」改成手机侧真名。
+   *
+   * <p>⚠️ 只做一次性的扫描，由下面的 MutationObserver 在**绘制之前**调用。
+   * 不能再挂 1.2 秒的 setInterval —— 那样用户会亲眼看到
+   * 「拉开抽屉 → 写着 root → 一秒后自己变成 dsh」，
+   * 录屏里 f07(t≈1.17s) 是 root、f13(t≈2.17s) 已经变成 dsh，
+   * 就是这个定时器造成的。
+   */
+  function sweepWorkspaceNames() {
+    try {
+      var want = realWorkspaceName();
+      if (!want || want === 'root') return;
+
+      // ① 左侧抽屉：工作区分组行（role=treeitem + aria-expanded）
+      var rows = document.querySelectorAll(
+        '[class*="sidebarCol"] [role="treeitem"][aria-expanded]');
+      for (var i = 0; i < rows.length; i++) rewriteText(rows[i], want);
+
+      /*
+       * ② 对话页顶部那个「📁 root ⌄」芯片。
+       *
+       * ⚠️ 2026-10-21：这里原来是 `querySelectorAll('button, [role="button"]')`
+       * —— **扫整页的每一个按钮**，每个还读一次 textContent。长会话里工具卡片、
+       * 消息操作条全是按钮，一次就是几百个；而这个函数由 DOM 变动触发，
+       * 从「插件 / 自动化任务」页返回时整块内容重排 → 连跑好几次。
+       * 这就是用户报的"从自动化、插件页面退出来也会卡顿"的主要来源之一。
+       *
+       * 现在只扫**顶部那一条**（芯片本来就在那儿）。
+       */
+      var heads = document.querySelectorAll(
+        '[class*="titleRow"],[class*="headerRow"],[class*="topBar"],[class*="chatHeader"]');
+      for (var h = 0; h < heads.length; h++) {
+        var hb = heads[h].querySelectorAll('button, [role="button"]');
+        for (var k = 0; k < hb.length; k++) {
+          if ((hb[k].textContent || '').trim() !== 'root') continue;
+          rewriteText(hb[k], want);
+        }
+      }
+      /*
+       * 兜底：DSH 哪天把这几个类名全改了，上面的选择器就一个都命中不了。
+       * 此时退化成"只看屏幕最上面 240px 内的按钮"，仍然是**有界的**，
+       * 不会回到扫整页那种开销。
+       */
+      if (heads.length === 0) {
+        var all = document.querySelectorAll('button');
+        for (var m = 0; m < all.length; m++) {
+          if ((all[m].textContent || '').trim() !== 'root') continue;
+          try { if (all[m].getBoundingClientRect().top > 240) continue; } catch (e2) { }
+          rewriteText(all[m], want);
+        }
+      }
+    } catch (e) { }
+  }
+
+  function patchWorkspaceNames() {
+    if (window.__dshWsNamePatched) return;
+    window.__dshWsNamePatched = true;
+
+    /*
+     * 用 MutationObserver 而不是定时器 —— 这是修「名字自己跳」的关键。
+     *
+     * MutationObserver 的回调在**同一次任务里、绘制之前**执行，
+     * 所以「节点插入 → 我们改名 → 浏览器绘制」是同帧完成的，用户看不到中间态；
+     * 而 setInterval 最快也要等下一轮，必然先画出 root 再改。
+     *
+     * 回调里再套一层 requestAnimationFrame：rAF 回调在样式/布局计算前后各跑一次，
+     * 能兜住"React 在本帧稍后又重建了一次节点"的情况。
+     */
+    try {
+      /*
+       * 便宜的准入判断：只有变动落在「抽屉 / 顶栏」这块范围里才值得扫。
+       *
+       * 插件页、自动化任务页整块换掉时会砸下上百条 mutation，全都不加分辨地
+       * 触发一次扫描，就是"退出来卡一下"的主要来源（2026-10-21 实测）。
+       * 这里只 closest 几次，成本可以忽略。
+       */
+      function worthSweeping(muts) {
+        var SEL = '[class*="sidebarCol"],[class*="titleRow"],[class*="headerRow"],[class*="topBar"]';
+        var n = Math.min(muts.length, 40);
+        for (var i = 0; i < n; i++) {
+          var m = muts[i];
+          try {
+            if (m.target && m.target.closest && m.target.closest(SEL)) return true;
+          } catch (e) { }
+          var add = m.addedNodes;
+          for (var j = 0; add && j < add.length && j < 4; j++) {
+            var an = add[j];
+            try {
+              if (an && an.nodeType === 1 && an.closest && an.closest(SEL)) return true;
+            } catch (e2) { }
+          }
+        }
+        return false;
+      }
+
+      var obs = new MutationObserver(function (muts) {
+        if (window.__dshWsSweeping) return;
+        if (!worthSweeping(muts)) return;
+        window.__dshWsSweeping = true;
+        try { sweepWorkspaceNames(); } catch (e) { }
+        window.__dshWsSweeping = false;
+      });
+      /*
+       * 只观察子节点与角色属性：观察 characterData 会让我们自己的改名再次触发回调，
+       * 虽然有 __dshWsSweeping 挡着，但没必要制造自激。
+       */
+      obs.observe(document.documentElement, {
+        childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'aria-expanded']
+      });
+      window.__dshWsObserver = obs;
+    } catch (e) { }
+
+    // 首屏 + 兜底：有些节点是"带内容插入"的，observer 已经覆盖；
+    // 这里只在启动瞬间补两次，之后靠 observer + 一条低频保险。
+    requestAnimationFrame(sweepWorkspaceNames);
+    setTimeout(sweepWorkspaceNames, 800);
+    /*
+     * 低频保险：观察器那道准入判断会漏掉"整体替换"这类变动
+     * （新节点是个大容器，自己不带 sidebarCol/titleRow 类，closest 判不出来）。
+     * 5 秒一次的带界扫描开销可以忽略（现在只扫抽屉和顶栏那一小圈），
+     * 但能保证名字最终一定正确。
+     */
+    every(guarded(sweepWorkspaceNames), 5000);
+  }
+
+  function patchThemeReport() {
+    if (window.__dshThemePatched) return;
+    window.__dshThemePatched = true;
+
+    var last = null;
+    function report() {
+      try {
+        if (!(window.DshAndroid && window.DshAndroid.setTheme)) return;
+        var t = detectDshTheme();
+        if (!t || t === last) return;         // 只有真的变了才推，否则原生侧会被反复触发
+        last = t;
+        window.DshAndroid.setTheme(t);
+      } catch (e) { }
+    }
+
+    report();
+    // 主题切换是 DOM 变动，监听属性 + 定时兜底（切的交互路径不止一条，定时最省心也最稳）
+    try {
+      new MutationObserver(function () { report(); })
+        .observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-theme', 'style'] });
+    } catch (e) { }
+    try {
+      new MutationObserver(function () { report(); })
+        .observe(document.body, { attributes: true, attributeFilter: ['class', 'data-theme', 'style'] });
+    } catch (e) { }
+    every(guarded(report), 4000);
+  }
+
+function patchDownloads() {
+    if (W.__dshDownloadPatched) return;
+    var A = window.DshAndroid;
+    if (!A || !A.saveFile) return;          // 桥未就绪：下次 apply 再来
+    W.__dshDownloadPatched = true;
+
+    function b64(buf) {
+      var bytes = new Uint8Array(buf), s = '', CH = 0x8000;
+      for (var i = 0; i < bytes.length; i += CH) {
+        s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+      }
+      return btoa(s);
+    }
+
+    /** 把 blob:/data: URL（或 Blob）读成字节交给安卓。返回是否已接管。 */
+    function save(src, name) {
+      try {
+        var p;
+        if (src instanceof Blob) p = src.arrayBuffer();
+        else if (typeof src === 'string' && /^(blob|data):/.test(src)) {
+          p = fetch(src).then(function (r) { return r.arrayBuffer(); });
+        } else return false;
+        p.then(function (buf) {
+          var res = A.saveFile(name || 'dsh-export', b64(buf));
+          if (res && String(res).indexOf('ERROR') === 0) report('下载失败：' + res);
+        })['catch'](function (e) { report('下载失败：' + e); });
+        return true;
+      } catch (e) { return false; }
+    }
+    W.__dshSaveBlob = save;
+
+    /*
+     * 主路径：包 HTMLAnchorElement.prototype.click。
+     *
+     * 为什么不用事件委托：导出代码常常是 createElement('a') 之后直接 .click()，
+     * 这个 a **从来没进过文档**，document 上的捕获监听根本收不到事件。
+     */
+    var proto = window.HTMLAnchorElement && HTMLAnchorElement.prototype;
+    if (proto && !proto.click.__dshWrapped) {
+      var origClick = proto.click;
+      var wc = function () {
+        try {
+          var href = this.getAttribute('href') || '';
+          var hasDl = this.hasAttribute('download');
+          if (hasDl && /^(blob|data):/.test(href)) {
+            if (save(href, this.getAttribute('download') || 'dsh-export')) return;
+          }
+        } catch (e) { /* 落回原生 */ }
+        return origClick.apply(this, arguments);
+      };
+      wc.__dshWrapped = true;
+      proto.click = wc;
+    }
+
+    /* 兜底：进了文档的 <a download> 用捕获阶段拦（避免浏览器自行发起无宿主的下载） */
+    document.addEventListener('click', function (ev) {
+      var a = ev.target && ev.target.closest ? ev.target.closest('a[download]') : null;
+      if (!a) return;
+      var href = a.getAttribute('href') || '';
+      if (!/^(blob|data):/.test(href)) return;
+      if (save(href, a.getAttribute('download') || 'dsh-export')) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+    }, true);
+  }
+
+  /*
+   * ── 剪贴板降级 ──────────────────────────────────────────────────
+   *
+   * 为什么需要：WebView 里 navigator.clipboard 经常不可用（非安全上下文 / 权限被拒）。
+   * DSH 有两条复制路径：
+   *   · 通用复制：先 clipboard、失败退 document.execCommand('copy') —— 能活
+   *   · 文件复制：**只用 clipboard，没有退路** —— 于是"文档里的字复制不出来"
+   * 这里把 clipboard.writeText 包一层：失败就落到安卓桥。
+   *
+   * 幂等：W.__dshClipboardPatched。
+   */
+  function patchClipboard() {
+    if (W.__dshClipboardPatched) return;
+    var A = window.DshAndroid;
+    if (!A || !A.copyText) return;
+    W.__dshClipboardPatched = true;
+
+    function viaAndroid(text) {
+      try { return String(A.copyText(text == null ? '' : text)) === 'OK'; }
+      catch (e) { return false; }
+    }
+
+    var cb = navigator.clipboard;
+    if (cb && typeof cb.writeText === 'function' && !cb.writeText.__dshWrapped) {
+      var orig = cb.writeText.bind(cb);
+      var w = function (text) {
+        return orig(text)['catch'](function (e) {
+          if (viaAndroid(text)) return;
+          throw e;
+        });
+      };
+      w.__dshWrapped = true;
+      try { cb.writeText = w; } catch (e) { /* 只读就算了，下面还有事件兜底 */ }
+    } else if (!cb) {
+      /* clipboard 对象整体不存在时补一个 */
+      try {
+        Object.defineProperty(navigator, 'clipboard', {
+          configurable: true,
+          value: {
+            writeText: function (t) {
+              return viaAndroid(t) ? Promise.resolve() : Promise.reject(new Error('copy failed'));
+            }
+          }
+        });
+      } catch (e) { }
+    }
+
+    /*
+     * 再兜一层：用户手动选字 Ctrl/Cmd+C 或右键复制时，
+     * 把选中的文本也镜像进系统剪贴板 ——
+     * WebView 自带的复制只落在它自己的剪贴板里，别的应用读不到。
+     */
+    document.addEventListener('copy', function () {
+      try {
+        var sel = window.getSelection ? String(window.getSelection()) : '';
+        if (sel) viaAndroid(sel);
+      } catch (e) { }
+    }, true);
+  }
+
   function apply() {
     ensureStyle();
     var narrow = window.innerWidth < NARROW_PX;
@@ -1264,6 +2524,121 @@
     patchWorkspacePicker();
     // 「在默认程序中打开 / 打开方式」→ 交给安卓（与屏幕宽度无关，平板同样需要）
     patchOpenInApp();
+    /*
+     * 下载与剪贴板 —— 同样与宽度无关。
+     *
+     * 这两件是"宿主能力缺口"，不是布局问题：
+     *   · 下载：WebView 里的 <a download> / blob 没有宿主，点了只会提示"正在下载"然后没反应
+     *   · 剪贴板：navigator.clipboard 在 WebView 里常不可用，而 DSH 的文件复制没有 execCommand 退路
+     * 所以它们必须在 apply() 的无条件段里，且自身幂等。
+     */
+    patchDownloads();
+    patchClipboard();
+    /*
+     * 主题上报 —— 用户要求原生页"跟随 DSH"而不是跟随系统。
+     *
+     * 这是唯一能知道 DSH 当前主题的地方（原生侧读不到 WebView 里的主题设置），
+     * 所以由这边探测、通过 AppBridge.setTheme 推给安卓。必须无条件跑。
+     */
+    /*
+     * 把左上角浮动鲸鱼（#dsh-rail-btn）推到状态栏下方。
+     *
+     * <p>edge-to-edge 之后网页画到状态栏底下，而它的 CSS 是写死的 top:8px，
+     * 结果鲸鱼顶进状态栏、压在时钟上（2026-10-17 用户截图）。
+     * 这里每 800ms 校正一次内联 top：CSS 那条规则优先级不够，
+     * 且按钮可能被 React 重建，用 !important 的内联写法最稳。
+     */
+    (function pinRailBelowStatusBar() {
+      function apply() {
+        try {
+          var el = document.getElementById('dsh-rail-btn');
+          if (!el || !(window.DshAndroid && window.DshAndroid.statusBarHeight)) return;
+          var h = window.DshAndroid.statusBarHeight() || 0;
+          if (h <= 0) return;
+          /*
+           * 以真机截图像素反推（不是套公式）：
+           *   · WebView 顶边 = contentRoot 的顶部内边距 = 114 - 17dp(51) ≈ 63px；
+           *   · 目标：按钮(40dp=120px)垂直中心 = 标题行中线 152px → 顶边 92px；
+           *   · 反推 CSS top = (92 - 63) / 3 ≈ 10px。
+           * 落位后底边 212px，标签行 221px 起 → 留 9px 余量，不压「对话/轨迹」。
+           */
+          /* fixed 元素不吃 body 的 padding，状态栏高度得自己加回来 */
+          /*
+           * 和内容用**同一个 base**（状态栏/倍率 - 6）。
+           * 之前这里写的是 状态栏+8，而 body 的 padding 改成了 -6，
+           * 两边差 14px，鲸鱼就比标题低一截（用户说“扶正不过来”）。
+           */
+          var railBase = Math.max(0, (window.DshAndroid.statusBarHeight() / (window.devicePixelRatio || 1)) - TOP_GAP);
+          var want = railBase + 'px';
+          if (el.style.top !== want) el.style.setProperty('top', want, 'important');
+          /*
+           * 深色模式适配（2026-10-17）：原来底色写死 rgba(255,255,255,.94)，
+           * 深色页面上一块亮白方块非常刺眼。这里按 DSH 当前主题换一套：
+           *   浅色 → 白底 + 蓝鲸 + 淡描边
+           *   深色 → 深灰半透底 + 浅蓝鲸 + 亮描边
+           */
+          var light = true;
+          try {
+            if (window.DshAndroid && window.DshAndroid.isLightTheme) light = window.DshAndroid.isLightTheme();
+          } catch (e) { }
+          var bg = light ? 'rgba(255,255,255,.94)' : 'rgba(58,62,72,.92)';
+          var fg = light ? '#3b6ef5' : '#8fb4ff';
+          var bd = light ? 'rgba(0,0,0,.07)' : 'rgba(255,255,255,.14)';
+          /*
+           * ⚠️ **不能加"变了才写"的门控**（2026-10-17）。
+           *
+           * 上一版用 dataset.railTheme 记"上次写过的主题"，标记没变就跳过。
+           * 实测退后台再回来时，DSH 重新渲染会把按钮的内联 background 冲掉、
+           * 退回 CSS 默认的浅色底 —— 而标记仍是 'D'，于是永远不再纠正，
+           * 深色页面上就挂着一块白。改回每拍无条件写：幂等，800ms 一次无感。
+           */
+          el.style.setProperty('background', bg, 'important');
+          el.style.setProperty('color', fg, 'important');
+          el.style.setProperty('border-color', bd, 'important');
+        } catch (e) { }
+      }
+      apply();
+      every(guarded(apply), POLL_MS);
+    })();
+    /*
+     * 让开状态栏 —— QQ / DeepSeek 的做法：页面背景一直画到屏幕最顶
+     * （状态栏底下），但内容自己往下让一个状态栏的高度。
+     *
+     * 为什么放在网页侧而不是原生侧：原生侧垫 padding 会在页面上方留一条
+     * "原生底色"的条，它和网页底色永远差一点点 —— 深色下变白条、浅色下变灰条。
+     * 放在网页侧就是同一层背景自己延伸，零接缝。
+     */
+    (function padForStatusBar() {
+      function apply() {
+        try {
+          if (!(window.DshAndroid && window.DshAndroid.statusBarHeight)) return;
+          var h = window.DshAndroid.statusBarHeight() || 0;
+          if (h <= 0) return;
+          /*
+           * 状态 2026-10-17 23:40 版（用户确认能用的那一版）。
+           *
+           * 主界面 + 侧边栏共用同一个 base；微调只改 -6 这一个数。
+           */
+          /*
+           * 横屏时状态栏更矮，再减 TOP_GAP 会让顶部空出一截；直接归零。
+           */
+          var landscape = window.innerWidth > window.innerHeight;
+          var base = landscape ? 0 : Math.max(0, (h / (window.devicePixelRatio || 1)) - TOP_GAP);
+          var px = base + 'px';
+          if (document.body.style.paddingTop !== px) {
+            document.body.style.setProperty('padding-top', px, 'important');
+            document.body.style.setProperty('box-sizing', 'border-box', 'important');
+          }
+          var side = document.querySelector('[class*="sidebarCol"]');
+          if (side && side.style.paddingTop !== px) side.style.setProperty('padding-top', px, 'important');
+        } catch (e) { }
+      }
+      apply();
+      every(guarded(apply), POLL_MS);
+    })();
+    patchThemeReport();
+    // 侧边栏工作区名改成"用户选的手机文件夹名"（见 patchWorkspaceNames 的注释）
+    patchWorkspaceNames();
     // 记下当前会话（插件页一开，这个信息就再也问不出来了，见函数注释）
     rememberCurrentSession();
     /*
@@ -1302,6 +2677,8 @@
      * __dshConsumed 标记，是给后者读的。
      */
     patchDrawerAutoClose();
+    // 点右边那块会话区域 → 收起抽屉回原会话（用户反馈的第一个问题）
+    patchWindowTapToCloseRail();
     patchQuestionCard();
 
     var dlg = settingsDialog();
@@ -1561,6 +2938,225 @@
    *      （老 WebView 语法解析失败就是这种）；
    *   ④ 启动卡在、但 60 秒还没往下走 → 卡在加载/等一个不存在的服务。
    */
+  /*
+   * ══════════ 悬浮球阶段：把「页面在不在干活」报给安卓 ══════════
+   *
+   * <h3>为什么必须由网页来报（GitHub issue：球永远显示「空闲」）</h3>
+   * 安卓那边原来的阶段判据只有两路：dsh 进程的 stdout（实际只有启动日志）
+   * 和容器 CPU 采样（等模型吐字时可能测不出增量）。两路都可能"看不见"，
+   * 于是球永远停在「空闲」、表情永远不换。
+   *
+   * 而**网页就是第一现场**：模型吐字是在往消息里追加文本节点，
+   * 跑工具是弹出一张工具卡片，报错是插入一段红字 —— 全是 DOM 变化。
+   * 所以这里用 MutationObserver 数"动静"，而不是去猜 DSH 的文案：
+   * 文案会随版本变，DOM 会变，**但"有东西在变"这件事不会变**。
+   *
+   * <h3>三条设计约束</h3>
+   * <ol>
+   *   <li><b>不扫整页</b>：只把"刚刚变化的那段文字"的尾巴留 600 字做分类，
+   *       绝不每秒钟 innerText 一遍（那本身就会卡，用户正在抱怨卡顿）；</li>
+   *   <li><b>不认死文案</b>：分类用的正则只是"锦上添花"，
+   *       认不出来时按「思考中」算 —— 有动静就说明它在干活，这个结论永远成立；</li>
+   *   <li><b>打字不算干活</b>：输入框是 contenteditable，用户每敲一个字都会产生
+   *       文本变化；不排除掉的话，一打字球就显示"思考中"（假信号）。</li>
+   * </ol>
+   */
+  (function pageStageWatch() {
+    var A = W.DshAndroid;
+    if (!A || (!A.pageBusy && !A.pageStage)) return;
+    var STAGE = { IDLE: 0, BOOT: 1, THINKING: 2, COMPILING: 3, WORKING: 4, DONE: 5, ERROR: 6 };
+    /*
+     * 两个计数器 —— **不读任何文字**（2026-10-21 改）。
+     *
+     * 第一版是拿"刚变化的文字"去正则匹配（/出错|失败|编译|执行/…），
+     * 结果冷启动时球报了一次「出错了」：因为**历史对话里本来就写着**
+     * 「dsh-pet 配置错误：配置加载失败」这类内容，会话一渲染就被当成"当前出错"。
+     * 这个坑和"安全模式误判"是同一个：**会话正文永远不能拿来判状态**。
+     *
+     * 现在只看 DOM 的"动法"，与文案语言无关：
+     *   · characterData 在动 → 文字在往消息里流 → 模型在吐字（思考中）
+     *   · 只有元素在增删    → 界面块在变但还没出字 → 工具在跑（干活中）
+     */
+    var charHits = 0;
+    var nodeHits = 0;
+    /** 最后一次"有动静"的时刻。 */
+    var lastSignalAt = 0;
+    var lastStage = -2;
+    var lastSentAt = 0;
+    var lastBusy = -1;
+    var obs = null;
+
+    /** 这个节点是不是在输入框里 / 在启动卡里（都不算"在干活"）。 */
+    function ignoreNode(node) {
+      try {
+        var el = node && (node.nodeType === 1 ? node : node.parentElement);
+        if (!el || !el.closest) return false;
+        // 输入框：用户打字本身也是文本变化，不能当成模型在干活
+        // 启动卡：那是 DSH 自己的加载动画，跟任务无关
+        return !!el.closest('[contenteditable="true"],input,textarea,[data-dsh-boot]');
+      } catch (e) { return false; }
+    }
+
+    try {
+      obs = new MutationObserver(function (muts) {
+        // 一次最多处理 160 条：流式输出时变更可能几千条，全处理反而拖慢页面
+        var n = Math.min(muts.length, 160);
+        for (var i = 0; i < n; i++) {
+          var m = muts[i];
+          try {
+            if (ignoreNode(m.target)) continue;
+            if (m.type === 'characterData') {
+              charHits++;
+            } else if (m.addedNodes && m.addedNodes.length) {
+              nodeHits++;
+            }
+          } catch (e) { }
+        }
+        if (muts.length) lastSignalAt = Date.now();
+      });
+      obs.observe(document.body || document.documentElement, {
+        childList: true, subtree: true, characterData: true
+      });
+    } catch (e) { obs = null; }
+
+    var tick = every(function () {
+      try {
+        var now = Date.now();
+        var active = (now - lastSignalAt) < 1500;
+        var busyBit = active ? 1 : 0;
+        if (busyBit !== lastBusy) {
+          lastBusy = busyBit;
+          try { if (A.pageBusy) A.pageBusy(busyBit); } catch (e) { }
+        }
+        if (active) {
+          /*
+           * 有字在流 → 模型在生成（思考中）；
+           * 光是块在增删、没有字流 → 多半是在跑工具（干活中）。
+           */
+          var st = (charHits >= 3) ? STAGE.THINKING
+                 : (nodeHits > 0 ? STAGE.WORKING : STAGE.THINKING);
+          charHits = 0;
+          nodeHits = 0;
+          /*
+           * 有动静时按**心跳**推送（最多 2 秒一次）：原生那边 6 秒没收到就退回
+           * 自己的判据，心跳停了就自然交接，不会卡在一个死阶段上。
+           */
+          if (st !== lastStage || (now - lastSentAt) > 2000) {
+            lastStage = st;
+            lastSentAt = now;
+            try { if (A.pageStage) A.pageStage(st); } catch (e) { }
+          }
+        } else if (lastStage !== -2 && lastStage !== STAGE.IDLE && lastStage !== STAGE.DONE) {
+          /*
+           * 刚停下来 → 报一次「已完成」，然后**不再上报**。
+           *
+           * 为什么之后要停：用户可能切到别的 App，页面不再产生 DOM 变化，
+           * 但我们不该因此一直喊"空闲" —— 停发之后原生会退回 CPU 判据，
+           * 后台真正在跑长任务时球仍然是对的。
+           */
+          lastStage = STAGE.DONE;
+          lastSentAt = now;
+          charHits = 0;
+          nodeHits = 0;
+          try { if (A.pageStage) A.pageStage(STAGE.DONE); } catch (e) { }
+        }
+      } catch (e) { }
+    }, 1000);
+
+    try {
+      W.addEventListener('pagehide', function () {
+        try { if (obs) obs.disconnect(); } catch (e) { }
+        try { clearInterval(tick); } catch (e) { }
+      });
+    } catch (e) { }
+  })();
+
+  /*
+   * ══════════ 输入法：只在用户点输入框时才弹（2026-10-21 用户要求）══════════
+   *
+   * <h3>为什么要拦（用户原话）</h3>
+   * "我不希望一切换对话就调动输入法弹出来，让用户自己选择，点输入框再弹出来。"
+   *
+   * <h3>为什么它自己会弹</h3>
+   * DSH 的输入框是 {@code contenteditable}，前端在**切换会话 / 新建会话 / 发完消息**
+   * 之后都会调一次 `editor.focus()`（桌面端这是对的：光标已经在输入框里，接着打字即可）。
+   * 但 Android 上"聚焦可编辑元素"= 系统弹输入法 —— 用户只是翻了一下会话列表，
+   * 键盘就自己顶上来，把半屏内容挤走。
+   *
+   * <h3>怎么拦才不误伤</h3>
+   * 判据是"这次聚焦**有没有手指参与**"：
+   *   · 最近 1.2 秒内有过 pointerdown / touchstart / keydown / input → 放行
+   *     （用户刚点过输入框、或者正在打字，此时任何聚焦都不该被打断）；
+   *   · 否则（纯脚本调用的 focus）→ 立刻 blur，键盘不弹。
+   *
+   * <p>`__dshAllowEditorFocus(ms)` 给自己人留一个明口：插附件/插路径这类
+   * **我们主动调 focus** 的场景，先开个窗口再调，免得被自己的守卫打回去。
+   */
+  (function imeFocusGuard() {
+    if (W.__dshImeGuard) return;
+    W.__dshImeGuard = true;
+    var lastEditableAt = 0;   // 最后一次"手指落在输入框/输入区"的时刻
+    var allowUntil = 0;
+
+    /** 这个节点是不是属于输入区（输入框本身，或者它周围那一条工具栏）。 */
+    function isComposerNode(node) {
+      try {
+        var el = node && (node.nodeType === 1 ? node : node.parentElement);
+        if (!el || !el.closest) return false;
+        return !!el.closest('input,textarea,[contenteditable="true"],[class*="composer"]');
+      } catch (e) { return false; }
+    }
+
+    /*
+     * ★ 只把"落在输入区上的手势"算作许可（2026-10-21 实测修正）。
+     *
+     * 第一版是"任何位置有手势都放行 1.2 秒"，结果实测**完全没用**：
+     * 用户点的是抽屉里的会话行，那次触摸本身就是手势，DSH 紧接着调 focus() ——
+     * 落在同一个 1.2 秒窗口里，于是被放行、键盘照样弹（真机复现：
+     * 点会话行 → activeElement 变成 DIV(editable)、mInputShown=true）。
+     *
+     * 现在只认**输入区里的手势**：点会话行不算许可 → 后续的脚本聚焦被吐掉。
+     * 而点输入框、点输入框上那条工具栏（附件/表情）仍然放行，
+     * 那些场景键盘本来就该弹。
+     */
+    function markGesture(ev) {
+      try {
+        if (ev && (ev.type === 'keydown' || ev.type === 'input')) {
+          lastEditableAt = Date.now();     // 打字只可能发生在输入区
+          return;
+        }
+        if (isComposerNode(ev && ev.target)) lastEditableAt = Date.now();
+      } catch (e) { }
+    }
+    ['pointerdown', 'touchstart', 'mousedown', 'keydown', 'input'].forEach(function (t) {
+      try { document.addEventListener(t, markGesture, true); } catch (e) { }
+    });
+
+    /** 给自家代码开一个"允许聚焦"的窗口（毫秒）。 */
+    W.__dshAllowEditorFocus = function (ms) {
+      allowUntil = Date.now() + (ms || 2000);
+    };
+
+    try {
+      document.addEventListener('focusin', function (ev) {
+        var el = ev.target;
+        if (!el || !el.isContentEditable) return;
+        var now = Date.now();
+        if (now - lastEditableAt < 1500) return;  // 用户刚点过输入区 → 这是他自己要的
+        if (now < allowUntil) return;             // 我们自己开的窗口
+        /*
+         * 脚本发起的聚焦 → 立刻吐出来。
+         * 用 blur() 而不是 preventDefault：focusin 已经在聚焦之后了，
+         * 只能"撤销"；blur 之后输入框依然可用，用户点一下就会再聚焦。
+         */
+        try {
+          el.blur();
+          W.__dshLastFocusKickAt = now;
+        } catch (e) { }
+      }, true);
+    } catch (e) { }
+  })();
+
   (function bootWatchdog() {
     if (W.__dshBootReported) return;
     var t0 = Date.now();
@@ -1644,56 +3240,6 @@
   })();
 
   /*
-   * 【用途守卫：扫到"明显违法用途"就交给 App 弹一次警告】
-   *
-   * 边界（与 App 侧 Guard.java 一致）：纯本地判断、不上报、不阻止；
-   * 关键词表由 App 提供（DshAndroid.guardPatterns），所以改词不用动这个补丁。
-   * 只在文本变化时扫，且最多 5 秒一次 —— 不做无谓的整页 innerText。
-   *
-   * 注意：它以前挂在「语音播报」那个 IIFE 里（因为那个 IIFE 也是 2 秒 tick 一次）。
-   * 语音整块撤掉之后必须**独立出来**，否则守卫会跟着一起消失。
-   */
-  (function misuseGuard() {
-    if (!W.DshAndroid || !W.DshAndroid.misuseDetected) return;
-
-    var rules = null;
-    var lastScan = 0;
-    var lastText = '';
-
-    function scan() {
-      var now = Date.now();
-      if (now - lastScan < 5000) return;
-      lastScan = now;
-      if (rules === null) {
-        try { rules = JSON.parse(W.DshAndroid.guardPatterns() || '[]'); }
-        catch (e) { rules = []; }
-      }
-      if (!rules.length) return;
-      var body = (document.body && document.body.innerText) || '';
-      if (body.length === lastText.length) return;      // 文本没变就不重复扫
-      lastText = body;
-      for (var i = 0; i < rules.length; i++) {
-        var r = rules[i];
-        if (r && r.k && body.indexOf(r.k) >= 0) {
-          lastScan = now + 3600000;                     // 命中后本页不再重复触发
-          try { W.DshAndroid.misuseDetected(r.k, r.w || ''); } catch (e) { }
-          return;
-        }
-      }
-    }
-
-    try {
-      if (document.documentElement) {
-        new MutationObserver(function () {
-          try { scan(); } catch (e) { }
-        }).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-      }
-    } catch (e) { }
-    setInterval(function () { try { scan(); } catch (e) { } }, 5000);
-    setTimeout(scan, 2000);
-  })();
-
-  /*
    * 【给「手机文件」插件用的插入函数】
    *
    * 插件（plugin/dsh-phone-files）自己不去碰输入框 —— 因为 DSH 的编辑器是
@@ -1710,6 +3256,11 @@
       if (!paths || !paths.length) return false;
       var box = document.querySelector('[contenteditable="true"]');
       if (!box) return false;
+      /*
+       * 先给自己开一个"允许聚焦"的窗口：下面这次 focus() 是**我们主动**调的，
+       * 会被 imeFocusGuard 当成脚本抢焦点而 blur 掉（那样 execCommand 落不到地方）。
+       */
+      try { if (W.__dshAllowEditorFocus) W.__dshAllowEditorFocus(3000); } catch (e) { }
       box.focus();
       var text = (box.innerText && box.innerText.trim() ? "\n" : "") + paths.join("\n");
       var ok = false;
