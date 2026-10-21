@@ -53,6 +53,10 @@ public class DshImeService extends InputMethodService {
     @Override
     public void onCreate() {
         super.onCreate();
+        // 跟随 DSH 主题：必须在建任何 View 之前设定，
+        // 否则会拿到上一个页面留下的颜色。
+        Ui.applyTheme(this);
+        Ui.applySystemBars(this);
         sInstance = this;
         Log.i(TAG, "输入法已创建");
     }

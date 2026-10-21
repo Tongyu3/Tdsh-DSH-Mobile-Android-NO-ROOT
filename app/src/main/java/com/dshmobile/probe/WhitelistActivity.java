@@ -60,6 +60,10 @@ public class WhitelistActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 跟随 DSH 主题：必须在建任何 View 之前设定，
+        // 否则会拿到上一个页面留下的颜色。
+        Ui.applyTheme(this);
+        Ui.applySystemBars(this);
         int pad = (int) (16 * getResources().getDisplayMetrics().density);
 
         LinearLayout root = new LinearLayout(this);
@@ -107,6 +111,12 @@ public class WhitelistActivity extends Activity {
 
         filter = new EditText(this);
         filter.setHint("搜索应用…");
+        /*
+         * ⚠️ 必须显式设颜色。这个 App 不引 appcompat，EditText 的文字色来自系统主题
+         * （深色 → 白字）；跟随 DSH 切成浅色主题后，白字落在浅灰底上就是**一片空白**。
+         * 用户报的"输入框看不见字"就是这一类。统一走 Ui.styleInput。
+         */
+        Ui.styleInput(filter);
         root.addView(filter);
 
         ListView list = new ListView(this);

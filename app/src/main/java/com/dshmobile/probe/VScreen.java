@@ -101,25 +101,23 @@ public final class VScreen {
     // ── 装 / 启 / 停 ─────────────────────────────────────────
 
     /**
-     * 一键：落资产 → 借 shell 身份搬运并拉起 → 等它真的能用。
+     * 一键：落资产 → 借特权身份搬运并拉起 → 等它真的能用。
+     *
+     * <p>身份优先用 **root**（见 {@link ShizukuBridge#preferRoot}）：root 不受 adbd
+     * 生死影响、还能开机自启，是"永久授权"的唯一正解；没有 root 才回落到 Shizuku。
      *
      * @return 给人看的执行报告（含守护自己的启动日志）
      */
     public static String installAndStart(Context c) throws Exception {
         String token = token(c);
         String stageDir = stage(c, token);
+        String script = VScreenCmd.installScript(stageDir, token);
         String out;
         try {
-            try {
-                out = ShizukuBridge.execShellDaemon(c, VScreenCmd.installScript(stageDir, token));
-            } catch (Throwable daemonFail) {
-                /*
-                 * daemon 用户服务在个别 Shizuku 版本/机型上起不来 —— 这时不要直接失败：
-                 * 退回普通用户服务也能把守护拉起来（守护本身是 `nohup` 脱离出去的，
-                 * 只有"App 进程被杀时"两者才有区别）。把原因写进输出，方便排查。
-                 */
-                out = "（daemon 模式不可用，已退回普通模式：" + daemonFail + "）\n"
-                        + ShizukuBridge.execShell(c, VScreenCmd.installScript(stageDir, token));
+            if ("root".equals(ShizukuBridge.privilegedBackend(c))) {
+                out = prefix("root") + ShizukuBridge.execAsRoot(script);
+            } else {
+                out = execViaShizuku(c, script);
             }
         } finally {
             // 暂存目录里有 token 与 dex —— 装完就删，别留在共享存储上
@@ -129,14 +127,43 @@ public final class VScreen {
         return out;
     }
 
+    /** 在报告里写明这次用的是哪个身份 —— 排查"守护为什么起不来"时这是第一个要看的信息。 */
+    private static String prefix(String backend) {
+        return "（身份：" + ("root".equals(backend) ? "root（su）" : "shell（Shizuku）") + "）\n";
+    }
+
+    /**
+     * 走 Shizuku 拉起，daemon 用户服务失败时退回普通用户服务。
+     *
+     * <p>为什么要有这个退回：daemon 用户服务在个别 Shizuku 版本/机型上起不来。
+     * 守护本身是 {@code nohup} 脱离出去的，所以两种模式**对守护的存活没有区别**，
+     * 差别只在"App 进程被杀时服务会不会跟着走"。
+     */
+    private static String execViaShizuku(Context c, String script) throws Exception {
+        try {
+            return ShizukuBridge.execShellDaemon(c, script);
+        } catch (Throwable daemonFail) {
+            return "（daemon 模式不可用，已退回普通模式：" + daemonFail + "）\n"
+                    + ShizukuBridge.execShell(c, script);
+        }
+    }
+
+    /** 同一个脚本按当前首选身份执行（停 / 重启守护用）。 */
+    private static String execPrivileged(Context c, String script) throws Exception {
+        if ("root".equals(ShizukuBridge.privilegedBackend(c))) {
+            return prefix("root") + ShizukuBridge.execAsRoot(script);
+        }
+        return execViaShizuku(c, script);
+    }
+
     /** 停掉守护。注意：虚拟屏上正在跑的应用会被系统一起收掉（方案固有行为）。 */
     public static String stop(Context c) throws Exception {
-        return ShizukuBridge.execShellDaemon(c, VScreenCmd.stopScript());
+        return execPrivileged(c, VScreenCmd.stopScript());
     }
 
     /** 只重启虚拟屏守护（改完分辨率 / 它崩了之后用）。 */
     public static String restartVsd(Context c) throws Exception {
-        return ShizukuBridge.execShellDaemon(c, VScreenCmd.restartVsdScript(token(c)));
+        return execPrivileged(c, VScreenCmd.restartVsdScript(token(c)));
     }
 
     /**

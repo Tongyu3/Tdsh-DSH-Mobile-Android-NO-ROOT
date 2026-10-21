@@ -36,6 +36,10 @@ public class VScreenActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 跟随 DSH 主题：必须在建任何 View 之前设定，
+        // 否则会拿到上一个页面留下的颜色。
+        Ui.applyTheme(this);
+        Ui.applySystemBars(this);
         LinearLayout root = Ui.page(this, "虚拟屏自动化", v -> finish());
 
         // ── 状态卡 ──
@@ -59,6 +63,12 @@ public class VScreenActivity extends Activity {
         cInstall.addView(Ui.button(this, "只重启虚拟屏守护", false, v -> doRestart()));
         cInstall.addView(Ui.button(this, "停止全部守护", false, v -> doStop()));
         root.addView(cInstall);
+
+        // ── 身份选择（root / Shizuku）──
+        // 用户要求"加入 root 启动选项"。有 root 的话它比 Shizuku 强在两点：
+        //   ① 不受 adbd 生死影响（adb 一重启 Shizuku 那条路的守护就全灭）；
+        //   ② Magisk 这类能开机自启 → 重启手机也不用管，才是真正的"永久授权"。
+        root.addView(buildIdentityCard());
 
         // ── 执行输出 ──
         LinearLayout cLog = Ui.card(this, "执行输出", "守护自己打的启动日志也在这里，失败时把它发给开发者。");
@@ -128,28 +138,90 @@ public class VScreenActivity extends Activity {
         });
     }
 
-    private void doInstall() {
-        if (!ShizukuBridge.isRunning() || !ShizukuBridge.hasPermission()) {
-            // 没授权就先把 Shizuku 那套引导走一遍，走完再让用户点一次（不自动接着装，避免"点一下跑一堆"）
+    /**
+     * 开始一次需要特权身份的操作前的统一闸门。
+     *
+     * <p>身份可以是 **root**（用户开了开关且 su 可用）或 **Shizuku**（原路径）。
+     * 两条都没有时才去走 Shizuku 的引导对话框 —— 以前这里硬判 Shizuku，
+     * 于是开了 root 的用户也会被拉去装/授权 Shizuku，是错的。
+     */
+    private boolean ensureBackend(String what) {
+        if ("none".equals(ShizukuBridge.privilegedBackend(this))) {
             ShizukuBridge.showGrantDialog(this, this::refresh);
-            return;
+            return false;
         }
+        return true;
+    }
+
+    private void doInstall() {
+        if (!ensureBackend("一键安装并启动")) return;
         run("一键安装并启动", () -> VScreen.installAndStart(this));
     }
 
     private void doRestart() {
-        if (!ShizukuBridge.isRunning() || !ShizukuBridge.hasPermission()) {
-            ShizukuBridge.showGrantDialog(this, this::refresh);
-            return;
-        }
+        if (!ensureBackend("重启虚拟屏守护")) return;
         run("重启虚拟屏守护", () -> VScreen.restartVsd(this));
     }
 
+    /**
+     * 「拉起守护的身份」卡片 —— 用户要求"加入 root 启动选项"。
+     *
+     * <p>为什么值得单独一张卡：身份决定**守护能活多久** ——
+     * Shizuku（uid 2000）的命绑在 adbd 的 cgroup 上，adb 服务重启/关掉调试开关/
+     * 重启手机都会让守护几秒内被 SIGKILL；root 不受这条约束，而且 Magisk 这类能开机自启，
+     * 所以它才是"永久授权"的正解。但没 root 的手机上探测 su 会弹授权框，
+     * 所以这个开关**默认关**，只在用户主动打开时才探一次。
+     */
+    private LinearLayout buildIdentityCard() {
+        final boolean prefer = ShizukuBridge.preferRoot(this);
+        boolean rootKnown = prefer && ShizukuBridge.rootAvailable(false);
+        LinearLayout card = Ui.card(this, "拉起守护的身份",
+                "决定守护能活多久：\n"
+                + "· Shizuku（shell）：不用 root，但守护的命绑在 adb 调试通道上 —— "
+                + "adb 一重启、关掉调试开关、或手机重启，守护几秒内就没；\n"
+                + "· root（su）：不受 adb 生死影响，而且 Magisk 这类能开机自启 —— "
+                + "重启手机也不用管，这才叫永久授权。\n\n"
+                + "当前：" + (prefer
+                        ? (rootKnown ? "优先用 root" : "已选 root，但 su 不可用（会回落到 Shizuku）")
+                        : "用 Shizuku（" + ShizukuBridge.statusText(this) + "）"));
+
+        card.addView(Ui.button(this, prefer ? "关掉 root，改用 Shizuku" : "试试用 root 拉起", true, v -> {
+            if (prefer) {
+                ShizukuBridge.setPreferRoot(this, false);
+                Toast.makeText(this, "已改为用 Shizuku", Toast.LENGTH_SHORT).show();
+                recreate();
+                return;
+            }
+            // 先讲清楚"马上会弹 root 授权框"，否则用户会以为弹窗是流氓行为
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("用 root 拉起守护")
+                    .setMessage("接下来会执行 `su -c id` 探测一次 root。\n\n"
+                            + "如果你装了 Magisk 之类的授权管理，会弹一个授权框，"
+                            + "请选「允许」（通常会记住选择）。\n\n"
+                            + "为什么值得：root 身份起的守护不受 adb 调试通道生死影响，"
+                            + "而且能开机自启 —— 就不用每次重启手机都手动点一次了。\n\n"
+                            + "没有 root 的手机上这一步会失败，什么都不会改，仍然用 Shizuku。")
+                    .setPositiveButton("探测", (d, w) -> {
+                        new Thread(() -> {
+                            final boolean ok = ShizukuBridge.rootAvailable(true);
+                            runOnUiThread(() -> {
+                                ShizukuBridge.setPreferRoot(this, ok);
+                                Toast.makeText(this, ok
+                                        ? "root 可用，之后都用 root 拉起守护"
+                                        : "没有拿到 root（su 不可用或被拒绝），继续用 Shizuku",
+                                        Toast.LENGTH_LONG).show();
+                                recreate();
+                            });
+                        }, "root-probe").start();
+                    })
+                    .setNegativeButton("算了", null)
+                    .show();
+        }));
+        return card;
+    }
+
     private void doStop() {
-        if (!ShizukuBridge.isRunning() || !ShizukuBridge.hasPermission()) {
-            ShizukuBridge.showGrantDialog(this, this::refresh);
-            return;
-        }
+        if (!ensureBackend("停止守护")) return;
         new AlertDialog.Builder(this)
                 .setTitle("停止全部守护？")
                 .setMessage("守护一停，虚拟屏上正在跑的应用会被系统一起收掉，之后要重新「一键安装并启动」。")

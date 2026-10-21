@@ -195,6 +195,155 @@ public final class ShizukuBridge {
         }
     }
 
+    // ── root 后端（用户要求："加入 root 启动选项"）─────────────────────────
+    //
+    // 【为什么要有它，以及它和 Shizuku 的关系】
+    // 虚拟屏那两个守护必须是 shell(uid 2000) 或 root 身份。身份只有两个来源：
+    //   ① adb / Shizuku（uid 2000）—— 命绑在 adbd 的 cgroup 上，adb 一重启就全灭，
+    //      而且没 root 时每次手机重启都要在 Shizuku 里重新启动一次；
+    //   ② **root（su）** —— 不受 adbd 生死影响，Magisk 这类还能开机自启 →
+    //      配合自动拉起就是真正的"永久授权"。
+    // 所以有 root 就优先走 root；没有 root 才回落到 Shizuku（原路径不动）。
+    //
+    // ⚠️ 不要用 root 去改 App 自身：targetSdk 28 的 W^X 限制与 root 无关，
+    // "root 启动"只影响守护与容器里的特权操作。要求 root 才能装 App 会把普通用户挡在门外。
+
+    /** 用户是否选择优先用 root（默认关：没 root 的手机上探测 su 会弹授权框，很烦）。 */
+    private static final String KEY_ROOT = "prefer_root";
+    /** root 探测结果缓存（null = 还没探过）。 */
+    private static volatile Boolean sRootOk = null;
+
+    public static boolean preferRoot(Context c) {
+        try {
+            return c.getSharedPreferences(DshService.PREFS, Context.MODE_PRIVATE)
+                    .getBoolean(KEY_ROOT, false);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    public static void setPreferRoot(Context c, boolean v) {
+        try {
+            c.getSharedPreferences(DshService.PREFS, Context.MODE_PRIVATE)
+                    .edit().putBoolean(KEY_ROOT, v).apply();
+            sRootOk = null;      // 开关一变，缓存作废（用户可能刚装了 Magisk）
+        } catch (Throwable ignore) { }
+    }
+
+    /**
+     * su 能不能用（缓存）。
+     *
+     * <p>**注意**：第一次调用会弹系统的 root 授权框（Magisk 等），
+     * 所以只应该在用户点了"用 root"或页面上要显示状态时才调，别在启动路径上无条件调。
+     */
+    public static boolean rootAvailable(boolean force) {
+        if (!force && sRootOk != null) return sRootOk;
+        boolean ok = false;
+        Process p = null;
+        try {
+            p = new ProcessBuilder("su", "-c", "id").redirectErrorStream(true).start();
+            // 用户要在授权框上点"允许"，给足时间（12 秒）；超时就当没有 root
+            Integer code = waitFor(p, 12000);
+            if (code != null && code == 0) {
+                ok = lastRootOutput.contains("uid=0");
+            }
+        } catch (Throwable t) {
+            ok = false;
+        } finally {
+            if (p != null) { try { p.destroy(); } catch (Throwable ignore) { } }
+        }
+        sRootOk = ok;
+        Log.i(TAG, "root 可用性: " + ok);
+        return ok;
+    }
+
+    /**
+     * 等一个进程结束，最多等 {@code timeoutMs}。
+     *
+     * <h3>为什么不用 {@code p.waitFor(超时, TimeUnit)}（lint 抓过一次）</h3>
+     * 那个重载是 **API 26** 才有的，而本项目 minSdk 是 **24** ——
+     * 用它会被 lint 记成 NewApi（项目铁律：NewApi 必须为 0），
+     * 在 Android 7.0/7.1 上更会直接 {@code NoSuchMethodError} 崩掉。
+     * 所以这里自己轮询 {@code exitValue()}（API 1 就有），
+     * 并且在等待期间**另起一个线程把输出读走** ——
+     * 否则命令输出超过管道缓冲（Linux 通常 64KB）时，子进程会卡在写、
+     * 我们卡在等，直接死锁。
+     *
+     * @return 进程的退出码；超时返回 null（调用方自己决定报错还是放弃）
+     */
+    private static Integer waitFor(Process p, long timeoutMs) {
+        final StringBuilder sink = new StringBuilder();
+        final Thread drain = new Thread(() -> {
+            try (java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream(), "UTF-8"))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    sink.append(line).append('\n');
+                    if (sink.length() > 200000) break;      // 输出上限，别把内存吃光
+                }
+            } catch (Throwable ignore) { }
+        }, "root-drain");
+        drain.setDaemon(true);
+        drain.start();
+        long deadline = System.currentTimeMillis() + Math.max(1000, timeoutMs);
+        Integer code = null;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                code = p.exitValue();
+                break;
+            } catch (IllegalThreadStateException stillRunning) {
+                try { Thread.sleep(100); } catch (InterruptedException ie) { break; }
+            } catch (Throwable t) {
+                break;
+            }
+        }
+        try { drain.join(1500); } catch (InterruptedException ignore) { }
+        if (code == null) { try { p.destroy(); } catch (Throwable ignore) { } }
+        lastRootOutput = sink.toString();
+        return code;
+    }
+
+    /** 最近一次 root 命令的输出（由 {@link #waitFor} 填写）。 */
+    private static volatile String lastRootOutput = "";
+
+    /**
+     * 以 root 身份跑一条命令。
+     *
+     * <p>输出约定与 {@link #execShell} 一致（{@code exit=n\n输出}），
+     * 这样调用方（VScreen）不用为了换后端写两套解析。
+     */
+    public static String execAsRoot(String command) throws Exception {
+        Process p = null;
+        try {
+            p = new ProcessBuilder("su", "-c", command).redirectErrorStream(true).start();
+            Integer code = waitFor(p, 120000);
+            if (code == null) throw new IllegalStateException("root 命令超时（120 秒）");
+            return "exit=" + code + "\n" + lastRootOutput;
+        } finally {
+            if (p != null) { try { p.destroy(); } catch (Throwable ignore) { } }
+        }
+    }
+
+    private static String readAll(Process p) {
+        StringBuilder sb = new StringBuilder();
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.InputStreamReader(p.getInputStream(), "UTF-8"))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                sb.append(line).append('\n');
+                if (sb.length() > 200000) break;      // 输出上限，别把内存吃光
+            }
+        } catch (Throwable ignore) { }
+        return sb.toString();
+    }
+
+    /** 拉起虚拟屏守护时该用哪个后端（给人看的名字 + 是否可用）。 */
+    public static String privilegedBackend(Context c) {
+        if (preferRoot(c) && rootAvailable(false)) return "root";
+        if (isRunning() && hasPermission()) return "shizuku";
+        return "none";
+    }
+
     // ── 一次点击完成授权 ────────────────────────────────────
 
     /** 界面上的「用 Shizuku 授权」按钮流程。 */

@@ -33,6 +33,10 @@ public class ServicesActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 跟随 DSH 主题：必须在建任何 View 之前设定，
+        // 否则会拿到上一个页面留下的颜色。
+        Ui.applyTheme(this);
+        Ui.applySystemBars(this);
 
         ScrollView scroll = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
@@ -200,12 +204,14 @@ public class ServicesActivity extends Activity {
         box.setPadding(pad, pad, pad, pad);
 
         final EditText name = new EditText(this);
+        Ui.styleInput(name);   // 底色/文字/提示色随主题
         name.setHint("名称，例如 CLIProxyAPI");
         name.setInputType(InputType.TYPE_CLASS_TEXT);
         if (existing != null) name.setText(existing.name);
         box.addView(name);
 
         final EditText cmd = new EditText(this);
+        Ui.styleInput(cmd);   // 底色/文字/提示色随主题
         cmd.setHint("启动命令，例如 node /root/cliproxyapi/server.js");
         cmd.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         if (existing != null) cmd.setText(existing.cmd);

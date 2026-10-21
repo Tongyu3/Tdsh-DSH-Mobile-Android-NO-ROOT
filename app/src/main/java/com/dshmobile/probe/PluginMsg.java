@@ -141,4 +141,161 @@ public final class PluginMsg {
         if (names.size() > n) sb.append("…（共 ").append(names.size()).append(" 个）");
         return sb.toString();
     }
+
+    /**
+     * 从 `cordis.patch.yml` 的**原文**里捞出所有插件包名。
+     *
+     * <h3>为什么要干这个（真机事故）</h3>
+     * 用户（小米 25091RP04C）装了个插件之后 App 直接进不去，日志点名
+     * `dsh-agnes-multimodal-fixed`。但那个名字**不在 profile 的 bundles 里** ——
+     * 它是通过这份 patch 文件被引用的。于是"自动停用第三方插件"算出来的候选是空的，
+     * 连续几次都"停用 0 个"后放弃，用户一直卡在 "Failed to load plugins" 那屏。
+     *
+     * <p>所以"该停谁"必须能**从配置文件里发现**，而不是只信 bundles 那张清单。
+     * 这里用正则捞两类形状（DSH 插件就这两种命名）：
+     *   · `@scope/name`（例如 `@linxin666/dsh-web-all`）；
+     *   · `dsh-xxx`（裸名，例如 `dsh-pet`）。
+     *
+     * <p>抽成纯逻辑放这里的理由和 {@link #parse} 一样：**能拿真机文本跑回归**。
+     * 误判的代价很实在 —— 多停一个用户自己的插件，或者漏停肇事那个让他继续进不去。
+     *
+     * @param yaml     patch 文件原文（null/空 → 返回空表）
+     * @param safeList 不该被停的（官方包 / 自带插件）；null 表示不过滤
+     */
+    public static List<String> pluginNamesIn(String yaml, Collection<String> safeList) {
+        List<String> out = new java.util.ArrayList<>();
+        if (yaml == null || yaml.isEmpty()) return out;
+        Set<String> safe = safeList == null ? new LinkedHashSet<String>() : new LinkedHashSet<>(safeList);
+        Set<String> seen = new LinkedHashSet<>();
+        Matcher m = YAML_NAME.matcher(yaml);
+        while (m.find()) {
+            String n = m.group();
+            if (n == null || n.isEmpty()) continue;
+            if (safe.contains(n)) continue;
+            if (n.startsWith("@deepseek-ai/")) continue;      // 官方包的任何子路径
+            if (seen.add(n)) out.add(n);
+        }
+        return out;
+    }
+
+    /**
+     * 捞包名用的正则。
+     *
+     * <p>刻意**宽松**（宁可多捞几个再由调用方按 safeList 过滤）：
+     * 这里的产出只用于"把可疑插件挪走"，漏掉一个的代价是用户继续进不去，
+     * 比多挪一个严重得多 —— 而多挪的那些在安全模式页能一键恢复。
+     */
+    private static final java.util.regex.Pattern YAML_NAME = java.util.regex.Pattern.compile(
+            "@[A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+|\\bdsh-[a-z0-9][A-Za-z0-9_.\\-]*");
+
+    /**
+     * 从 `cordis.patch.yml` 里**摘掉**那些引用指定插件名的顶层条目。
+     *
+     * <h3>为什么必须动配置，不能只挪目录（群友笔记点名的缺口）</h3>
+     * 群友的《DSH 插件急救笔记》原话：
+     * <blockquote>
+     *   App 的「自救·手动安全模式」只认 `dsh.profile.bundles` 里列出的 bundle。
+     *   如果坏掉的东西是通过 `cordis.patch.yml` 的 `- insert:` 挂进去的，
+     *   **安全模式永远清不掉它**，于是每次开机都重复同一个错 ——
+     *   这就是「重启多少次都没用」的原因。
+     * </blockquote>
+     * 而且这类插件常常**根本不在 node_modules 里**（运行时 insert 进来的），
+     * 所以"把包目录挪走"对它完全无效。唯一可靠的办法就是**改这份配置**。
+     *
+     * <h3>怎么摘</h3>
+     * 这份文件的顶层是一个**条目数组**，每个条目以 `- id:` 起头。所以按行扫描：
+     * 遇到顶层条目起点就结算上一块；哪个块里提到了要停的插件名，整块丢掉。
+     * 这样不会误伤别的条目（例如中转站那条 `llm-pi-ai`），也不破坏缩进结构。
+     *
+     * <p>抽成纯逻辑放这里的理由同 {@link #parse}：**能拿真机文本跑回归**。
+     * 摘错一个条目 = 用户的模型路由没了；漏摘 = 他继续进不去。
+     *
+     * @param yaml  patch 文件原文（null/空 → 原样返回）
+     * @param names 要摘掉的插件名（null/空 → 原样返回）
+     * @return 摘干净后的 YAML；**没摘掉任何东西时原样返回**（不做无谓的文件改动）
+     */
+    public static String stripEntries(String yaml, Collection<String> names) {
+        if (yaml == null || yaml.isEmpty() || names == null || names.isEmpty()) return yaml;
+        String[] lines = yaml.split("\n", -1);
+        StringBuilder out = new StringBuilder();
+        StringBuilder block = new StringBuilder();
+        boolean dropBlock = false;
+        boolean changed = false;
+
+        for (String line : lines) {
+            boolean isEntryStart = line.startsWith("- ") || line.equals("-");
+            if (isEntryStart && block.length() > 0) {
+                if (dropBlock) changed = true; else out.append(block);
+                block.setLength(0);
+                dropBlock = false;
+            }
+            if (isEntryStart) {
+                dropBlock = containsAny(line, names);
+            } else if (!dropBlock && containsAny(line, names)) {
+                dropBlock = true;      // 名字写在条目内部（例如 name: dsh-xxx）
+            }
+            block.append(line).append('\n');
+        }
+        if (block.length() > 0) {
+            if (dropBlock) changed = true; else out.append(block);
+        }
+        return changed ? out.toString() : yaml;
+    }
+
+    /** 这一行有没有提到要停的插件名（按词边界，避免部分匹配误伤）。 */
+    private static boolean containsAny(String line, Collection<String> names) {
+        if (line == null) return false;
+        for (String n : names) {
+            if (n == null || n.isEmpty()) continue;
+            int i = line.indexOf(n);
+            while (i >= 0) {
+                char before = i == 0 ? ' ' : line.charAt(i - 1);
+                int end = i + n.length();
+                char after = end >= line.length() ? ' ' : line.charAt(end);
+                if (!isNameChar(before) && !isNameChar(after)) return true;
+                i = line.indexOf(n, i + 1);
+            }
+        }
+        return false;
+    }
+
+    /** 包名允许出现的字符（用于词边界判断）。 */
+    private static boolean isNameChar(char c) {
+        return Character.isLetterOrDigit(c) || c == '-' || c == '_' || c == '.' || c == '/' || c == '@';
+    }
+
+    /**
+     * 抽出 `cordis.patch.yml` 里每个顶层条目的 `id:`。
+     *
+     * <h3>为什么光捞包名不够</h3>
+     * 这类 patch 条目长这样：
+     * <pre>
+     * - id: llm-pi-ai            # 我们自己的（中转站），不能动
+     *   config: ...
+     * - id: agnes-multimodal     # 肇事插件的挂载点，**id 里没有包名**
+     *   name: dsh-agnes-multimodal
+     * </pre>
+     * 只按包名过滤的话，第二类条目在有的写法下匹配不到（名字写在别处、或只用 id）。
+     * 所以两边都要拿：条目 id 与包名一起当作"可疑插件名"送去停用。
+     *
+     * <p>调用方务必用安全名单把官方/自带/我们自己的条目排除掉
+     * （例如 `llm-pi-ai` 是小程序写的中转站路由，摘了用户的模型配置就没了）。
+     */
+    public static List<String> entryIdsIn(String yaml) {
+        List<String> out = new java.util.ArrayList<>();
+        if (yaml == null || yaml.isEmpty()) return out;
+        Set<String> seen = new LinkedHashSet<>();
+        for (String line : yaml.split("\n", -1)) {
+            Matcher m = ENTRY_ID.matcher(line);
+            if (m.find()) {
+                String id = m.group(1);
+                if (id != null && !id.isEmpty() && seen.add(id)) out.add(id);
+            }
+        }
+        return out;
+    }
+
+    /** 顶层条目的 `- id: xxx`（只看以 `- ` 起头的行，避免匹配到嵌套的 id）。 */
+    private static final java.util.regex.Pattern ENTRY_ID =
+            java.util.regex.Pattern.compile("^-\\s+id:\\s*[\"']?([A-Za-z0-9_@./\\-]+)");
 }

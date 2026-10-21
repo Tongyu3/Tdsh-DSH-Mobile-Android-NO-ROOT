@@ -49,6 +49,10 @@ public class RelayActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 跟随 DSH 主题：必须在建任何 View 之前设定，
+        // 否则会拿到上一个页面留下的颜色。
+        Ui.applyTheme(this);
+        Ui.applySystemBars(this);
         root = Ui.page(this, "中转站", v -> onBackPressed());
         render();
     }
@@ -77,6 +81,10 @@ public class RelayActivity extends Activity {
                 "连接中转站、自部署服务或其他兼容 OpenAI / Anthropic 协议的接口。"
                 + "保存后模型会出现在 DSH 的模型选择器里，选哪个用哪个。"
                 + "密钥只存本机（App 私有目录），经环境变量注入容器，不写进配置文件。"));
+
+        // 官方 API 放在最上面：它和下面的自定义提供方是**两套东西**，
+        // 以前散在两个页面里，用户看不出"我到底在用哪家"（见 Relay 里的说明）。
+        root.addView(buildOfficialCard());
 
         List<Relay.Route> list = Providers.load(this);
         for (Relay.Route r : list) {
@@ -229,6 +237,9 @@ public class RelayActivity extends Activity {
                     r.api = Relay.API_ANTHROPIC; render();
                 }));
 
+        // 重试策略（用户要求："自定义连不上重试次数"）
+        root.addView(buildRetryCard(r));
+
         // 密钥
         root.addView(field("API 密钥", Providers.key(this, r.id),
                 "只存本机（App 私有目录），经环境变量注入容器，不写进任何配置文件；"
@@ -273,9 +284,9 @@ public class RelayActivity extends Activity {
         manual.setHint("手动添加模型 ID");
         manual.setTextSize(15);
         manual.setTextColor(Ui.TEXT);
-        manual.setHintTextColor(0xFF6B7076);
+        manual.setHintTextColor(Ui.SUB);
         manual.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        manual.setBackground(Ui.round(0xFF141416, Ui.STROKE, 8, this));
+        manual.setBackground(Ui.inputBg(this));
         models.addView(manual);
         models.addView(Ui.button(this, "+ 添加", false, v -> {
             String id = manual.getText().toString().trim();
@@ -389,7 +400,7 @@ public class RelayActivity extends Activity {
         et.setInputType(secret
                 ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
                 : InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        et.setBackground(Ui.round(0xFF141416, Ui.STROKE, 8, this));
+        et.setBackground(Ui.inputBg(this));
         box.addView(et);
         et.setOnFocusChangeListener((v, has) -> { if (!has) cb.on(et.getText().toString()); });
         // 编辑态里也可能直接点"保存"而输入框还没失焦，所以再兜一层
@@ -401,12 +412,203 @@ public class RelayActivity extends Activity {
         if (hint != null) {
             TextView h = new TextView(this);
             h.setText(hint);
-            h.setTextColor(0xFF7F8489);
+            h.setTextColor(Ui.SUB);
             h.setTextSize(12);
             h.setPadding(0, Ui.dp(this, 6), 0, 0);
             box.addView(h);
         }
         return box;
+    }
+
+    /**
+     * 「官方 API」卡片 —— 放在中转站页最上面，让"我到底在用哪家"一眼可见。
+     *
+     * <p>它解决的是用户那条反馈：「修一下没配置官方 api 联网搜索时会爆红」。
+     * 官方的 provider 名是 {@code deepseek-official}（DSH 自带适配器），
+     * 密钥走环境变量 {@code DEEPSEEK_API_KEY} —— 也就是这张卡里填的那个。
+     * 以前它藏在设置页的一个对话框里，用户在"中转站"页配了一堆自定义提供方之后，
+     * 完全看不出官方那家还是空的。
+     */
+    private View buildOfficialCard() {
+        final String key = DshService.getApiKey(this);
+        boolean hasKey = key != null && !key.trim().isEmpty();
+        LinearLayout card = Ui.card(this, "官方 API（DeepSeek）",
+                "DSH 默认就用这一家。密钥只存本机，经环境变量 DEEPSEEK_API_KEY 注入容器。\n"
+                + "状态：" + (hasKey
+                        ? ("已配置（" + maskKey(key) + "）")
+                        : "**还没配置** —— 联网搜索、默认模型都会失败（界面上表现为爆红）")
+                + "\n" + ApiKey.describe(key));
+
+        final TextView state = Ui.status(this, "", Ui.SUB);
+
+        card.addView(field("官方 API Key", hasKey ? key : "",
+                "在 platform.deepseek.com 申请，形如 sk-…；留空 = 不用官方（只用下面自定义的提供方）\n"
+                + "粘贴进来会自动清掉多余的空格、换行、零宽字符和全角符号（这些是"
+                + "「明明填了却说 Key 不对」的最常见原因）",
+                true, v -> {
+                    /*
+                     * ⚠️ 这里**必须走 ApiKey.sanitize**，不能只 trim()。
+                     *
+                     * trim() 只裁 <= 0x20 的字符；而复制粘贴最常见的污染物
+                     * （\u200B 零宽空格、\uFEFF BOM、\u3000 全角空格、全角连字符）
+                     * 一个都裁不掉。带着它们发出去，服务端只会回"invalid api key"，
+                     * 用户完全看不出问题在哪 —— 这正是上一次发的那个 bug。
+                     */
+                    String clean = ApiKey.sanitize(v);
+                    DshService.setApiKey(this, clean);
+                    if (clean.isEmpty()) {
+                        state.setText("已清空官方 Key —— 点下面的按钮重启 DSH 后才生效");
+                    } else if (!ApiKey.plausible(clean)) {
+                        state.setText("已记录，但**形态不像**官方 Key（应以 sk- 开头、"
+                                + "后面只有字母数字）。当前：" + ApiKey.describe(v));
+                    } else {
+                        state.setText("已记录：" + ApiKey.describe(v)
+                                + " —— 点下面的按钮重启 DSH 后才生效");
+                    }
+                }));
+
+        card.addView(Ui.button(this, "测试官方 API 能不能连上", true, v -> {
+            final String k = DshService.getApiKey(this);
+            if (k == null || k.trim().isEmpty()) {
+                state.setText("先在上面填一个 Key 再测。");
+                return;
+            }
+            state.setText("正在连 " + Relay.OFFICIAL_BASE + " …");
+            new Thread(() -> {
+                String msg;
+                try {
+                    msg = "✅ " + Providers.testOfficial(k.trim());
+                } catch (Throwable t) {
+                    String m = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+                    // Providers 抛出来的已经是人话（见 Relay.explainOfficialError）
+                    msg = "❌ " + m;
+                }
+                final String out = msg;
+                runOnUiThread(() -> {
+                    state.setText(out);
+                    appendReport("  [官方API] 测试：" + out + "\n");
+                });
+            }, "official-api-test").start();
+        }));
+        card.addView(state);
+
+        card.addView(Ui.button(this, "保存并重启 DSH 让它生效", false, v -> {
+            DshService.requestRestart();
+            toast("正在重启 DSH，界面会自己回来");
+        }));
+        return card;
+    }
+
+    /** 密钥只露头尾，中间打码（截图/发日志时不至于把密钥带出去）。 */
+    private static String maskKey(String k) {
+        String s = k == null ? "" : k.trim();
+        if (s.length() <= 10) return "已设置";
+        return s.substring(0, 7) + "…" + s.substring(s.length() - 4);
+    }
+
+    /**
+     * 「重试策略」卡片 —— 用户要求"自定义连不上重试次数"。
+     *
+     * <p>依据（读的是容器里真装的 pi-ai 包，不是猜的）：
+     * {@code @deepseek-ai/dsh-llm-pi-ai} 的 README 写明
+     * 「每个 profile 都可以设置 {@code retryPolicy}；省略时使用 normal mode、最多重试五次」，
+     * 类型定义在 {@code @deepseek-ai/dsh-llm/retry-policy.d.ts}：
+     * <pre>
+     *   normal: { mode: normal, maxRetries?: number, backoff?: { initialDelayMs?, maxDelayMs?, jitterRatio? } }
+     *   always: { mode: always, backoff?: {...} }        // 一直重到成功/取消（没有 maxRetries）
+     * </pre>
+     *
+     * <p>为什么做成"点按钮选"而不是输入框：这几个值是离散的小集合，
+     * 手机上打字容易输错（maxRetries 写成 1e3 之类会让整个配置被 schema 拒掉，
+     * 而 DSH 的报错原文用户根本看不懂）。点一下就存，零输入错误。
+     *
+     * <p>为什么默认一个字都不写：不写 = 跟随 DSH 默认（normal / 5 次），
+     * 也就是"和升级前完全一样"。只有用户真的点了才写进 YAML —— 少改就少出错。
+     */
+    private View buildRetryCard(final Relay.Route r) {
+        LinearLayout card = Ui.card(this, "重试策略",
+                "连不上/服务端临时出错时，DSH 会按这里的策略重试。\n"
+                + "不选 = 跟随 DSH 默认（normal，最多 5 次）。\n"
+                + "状态：" + r.retryLabel());
+
+        // 模式
+        card.addView(choice("跟随默认（normal，5 次）", "什么都不写，和以前完全一样",
+                !r.hasRetry() || r.retryMode == null || r.retryMode.isEmpty(), () -> {
+                    r.retryMode = ""; r.retryMax = -1; r.retryDelayMs = -1; r.retryMaxDelayMs = -1;
+                    render();
+                }));
+        card.addView(choice("normal（只重试可恢复的错误）", "限流、超时、5xx 这类会重试；参数写错不会",
+                "normal".equals(r.retryMode), () -> {
+                    r.retryMode = "normal";
+                    if (r.retryMax < 0) r.retryMax = 5;
+                    render();
+                }));
+        card.addView(choice("always（一直重试到成功）", "任何失败都重试，直到成功或被取消 —— 断网很久时会一直等",
+                "always".equals(r.retryMode), () -> {
+                    r.retryMode = "always"; r.retryMax = -1;
+                    render();
+                }));
+
+        // 次数（always 模式没有次数，不显示）
+        if ("normal".equals(r.retryMode)) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(0, Ui.dp(this, 10), 0, 0);
+            TextView lab = new TextView(this);
+            lab.setText("最多重试");
+            lab.setTextColor(Ui.TEXT);
+            lab.setTextSize(14);
+            lab.setLayoutParams(new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            row.addView(lab);
+            for (final int n : new int[]{0, 3, 5, 10}) {
+                TextView b = Ui.button(this, String.valueOf(n), r.retryMax == n, v -> {
+                    r.retryMax = n;
+                    render();
+                });
+                b.setLayoutParams(wrapLp());
+                row.addView(b);
+            }
+            card.addView(row);
+        }
+
+        // 退避（首次间隔）
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        row2.setGravity(Gravity.CENTER_VERTICAL);
+        row2.setPadding(0, Ui.dp(this, 10), 0, 0);
+        TextView lab2 = new TextView(this);
+        lab2.setText("首次等待");
+        lab2.setTextColor(Ui.TEXT);
+        lab2.setTextSize(14);
+        lab2.setLayoutParams(new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row2.addView(lab2);
+        int[] delays = {500, 1000, 2000, 5000};
+        String[] delayNames = {"0.5s", "1s", "2s", "5s"};
+        for (int i = 0; i < delays.length; i++) {
+            final int d = delays[i];
+            TextView b = Ui.button(this, delayNames[i], r.retryDelayMs == d, v -> {
+                // 选默认（-1）之后的第一次点击才算"我改过"
+                r.retryDelayMs = d;
+                if (r.retryMaxDelayMs < 0) r.retryMaxDelayMs = Math.max(d * 10, 10000);
+                if ((r.retryMode == null || r.retryMode.isEmpty())) r.retryMode = "normal";
+                render();
+            });
+            b.setLayoutParams(wrapLp());
+            row2.addView(b);
+        }
+        card.addView(row2);
+
+        TextView note = new TextView(this);
+        note.setText("默认是 0.5s 起步、每次翻倍（上限 10s）。次数与等待都只在保存后写进 DSH 的配置，"
+                + "重启 DSH 生效。");
+        note.setTextColor(Ui.SUB);
+        note.setTextSize(12);
+        note.setPadding(0, Ui.dp(this, 8), 0, 0);
+        card.addView(note);
+        return card;
     }
 
     private interface FieldCb { void on(String v); }

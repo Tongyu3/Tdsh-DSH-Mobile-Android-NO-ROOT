@@ -3,7 +3,6 @@ package com.dshmobile.probe;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
-
 /**
  * 「中转站」里那几段**纯逻辑**：数据模型 + Provider ID 规则 + 写进 DSH 配置的那段 YAML。
  *
@@ -62,6 +61,61 @@ public final class Relay {
     public static final String PI_AI_ENTRY_ID = "llm-pi-ai";
     public static final String PI_AI_PLUGIN_NAME = "@deepseek-ai/dsh-llm-pi-ai";
 
+    // ─────────────────────── 官方 API（DeepSeek 自己那家） ───────────────────────
+    //
+    // 【为什么官方 API 单独列出来，而不是当成一条普通"中转站"】
+    // DSH 里官方的 provider 名是 **deepseek-official**（真机上 agent-default-model
+    // 那条补丁配的就是 `provider: deepseek-official` / `model: deepseek-flash`），
+    // 它由 DSH 自带的适配器提供，密钥走 **环境变量 DEEPSEEK_API_KEY**
+    // （App 已经这么注入了）。所以它和我们写进 `llm-pi-ai.providers` 的那些
+    // 自定义 route 是**两套东西**：
+    //   · 官方：改密钥 = 改环境变量（App 私有 prefs → 启动参数），不需要碰配置文件；
+    //   · 自定义：写 cordis.patch.yml 的 `llm-pi-ai` 条目。
+    // 正因为是两套，界面上以前它们散在两个地方（「API Key」对话框 + 「中转站」），
+    // 用户根本看不出"我到底在用哪家"。现在把官方这张卡放在「中转站」页最上面，
+    // 两边的配置在同一个屏幕上看得见。
+
+    /** 官方 API 的基址（只用于界面上展示与连通性测试）。 */
+    public static final String OFFICIAL_BASE = "https://api.deepseek.com";
+    /** 官方 API 的 provider 名（DSH 的默认值，别改）。 */
+    public static final String OFFICIAL_PROVIDER = "deepseek-official";
+
+    /**
+     * 官方 API 的「人话报错」：把 HTTP 状态码翻译成用户能照做的下一步。
+     *
+     * <p>为什么必须做这个：DSH 里报错是一串英文（
+     * {@code MISSING_CREDENTIAL} / {@code 401} / {@code fetch failed}），
+     * 用户看完只知道"爆红了"。这里把它翻成"你该去做什么"。
+     *
+     * @param code HTTP 状态码（0 表示连都没连上）
+     * @param body 响应体（可能为空）
+     * @return 给用户看的一句话
+     */
+    public static String explainOfficialError(int code, String body) {
+        String b = body == null ? "" : body.replaceAll("\\s+", " ").trim();
+        if (b.length() > 160) b = b.substring(0, 160) + "…";
+        switch (code) {
+            case 0:
+                return "连不上 api.deepseek.com —— 检查手机网络（或是否被代理/VPN 拦住）。";
+            case 400:
+                return "请求被拒绝（400）。多半是模型名不对，或这个 Key 没有该模型的权限。原始返回：" + b;
+            case 401:
+                return "密钥不对或已失效（401）—— 去 platform.deepseek.com 重新生成一个再填进来。";
+            case 402:
+                return "余额不足（402）—— 账户里没钱了，充值后即可恢复。";
+            case 403:
+                return "没有权限（403）—— 这个 Key 可能被限制或已停用。原始返回：" + b;
+            case 404:
+                return "地址不对（404）—— 官方基址应当是 " + OFFICIAL_BASE + "（不要带 /v1 之外的后缀）。";
+            case 429:
+                return "请求太频繁或额度用尽（429）—— 等一会儿再试，或在「重试策略」里把次数调大。";
+            case 500: case 502: case 503: case 504:
+                return "官方服务临时故障（" + code + "）—— 这不是你的配置问题，稍后自动重试即可。";
+            default:
+                return "HTTP " + code + "：" + b;
+        }
+    }
+
     /** 一个模型条目。 */
     public static final class Model {
         public String id;
@@ -83,7 +137,41 @@ public final class Relay {
         public String baseUrl;
         public final List<Model> models = new ArrayList<>();
 
+        /*
+         * 重试策略（用户要求"自定义连不上重试次数"）。
+         *
+         * 依据：pi-ai 的 README「每个 profile 都可以设置 retryPolicy；省略时使用
+         * normal mode、最多重试五次」，类型定义在 dsh-llm 的 retry-policy.d.ts：
+         *   NormalRetryPolicyConfig { mode:'normal', maxRetries?, retryableCodes?, backoff? }
+         *   AlwaysRetryPolicyConfig { mode:'always', backoff? }
+         *
+         * ⚠️ retryPolicy 是**提供方路由级**的，不是全局的 —— 所以每个提供方各存一份。
+         * 用户没动过这几个字段时**一个字都不写**（见下文 renderRoutes），
+         * 这样配置文件保持和以前完全一样，不会因为"多了几个默认字段"而改变行为。
+         */
+        public String retryMode = "";      // "" = 不写（用 DSH 默认 normal/5）| "normal" | "always"
+        public int retryMax = -1;          // <0 = 不写
+        public int retryDelayMs = -1;      // <0 = 不写（DSH 默认 500）
+        public int retryMaxDelayMs = -1;   // <0 = 不写（DSH 默认 10000）
+
         public Route() { }
+
+        /** 用户是否改过重试策略（改过才写进 YAML）。 */
+        public boolean hasRetry() {
+            return (retryMode != null && !retryMode.isEmpty()) || retryMax >= 0
+                    || retryDelayMs >= 0 || retryMaxDelayMs >= 0;
+        }
+
+        /** 给人看的一行重试说明（界面上显示）。 */
+        public String retryLabel() {
+            if (!hasRetry()) return "重试：跟随 DSH 默认（normal，5 次）";
+            String mode = "always".equals(retryMode) ? "always（一直重试到成功）" : "normal（只重试可恢复的错误）";
+            StringBuilder sb = new StringBuilder("重试：").append(mode);
+            if (retryMax >= 0 && !"always".equals(retryMode)) sb.append("，最多 ").append(retryMax).append(" 次");
+            if (retryDelayMs >= 0) sb.append("，首次间隔 ").append(retryDelayMs).append("ms");
+            if (retryMaxDelayMs >= 0) sb.append("，最长间隔 ").append(retryMaxDelayMs).append("ms");
+            return sb.toString();
+        }
 
         public String apiLabel() {
             if (API_OPENAI_RESP.equals(api)) return "OpenAI Responses";
@@ -142,6 +230,20 @@ public final class Relay {
             }
             sb.append("        api: ").append(r.api).append('\n');
             sb.append("        baseURL: ").append(yamlScalar(r.baseUrl == null ? "" : r.baseUrl.trim())).append('\n');
+            // 重试策略：没改过就一个字都不写（保持与以前完全一致的配置）
+            if (r.hasRetry()) {
+                sb.append("        retryPolicy:\n");
+                sb.append("          mode: ").append("always".equals(r.retryMode) ? "always" : "normal").append('\n');
+                // always 模式没有 maxRetries（它一直重到成功/取消），写了会被 schema 拒绝
+                if (!"always".equals(r.retryMode) && r.retryMax >= 0) {
+                    sb.append("          maxRetries: ").append(r.retryMax).append('\n');
+                }
+                if (r.retryDelayMs >= 0 || r.retryMaxDelayMs >= 0) {
+                    sb.append("          backoff:\n");
+                    if (r.retryDelayMs >= 0) sb.append("            initialDelayMs: ").append(r.retryDelayMs).append('\n');
+                    if (r.retryMaxDelayMs >= 0) sb.append("            maxDelayMs: ").append(r.retryMaxDelayMs).append('\n');
+                }
+            }
             sb.append("        models:\n");
             for (Model m : r.models) {
                 sb.append("          - id: ").append(yamlScalar(m.id)).append('\n');

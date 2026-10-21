@@ -61,6 +61,10 @@ public class TerminalActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 跟随 DSH 主题：必须在建任何 View 之前设定，
+        // 否则会拿到上一个页面留下的颜色。
+        Ui.applyTheme(this);
+        Ui.applySystemBars(this);
         LinearLayout root = Ui.page(this, "容器终端", v -> finish());
 
         // ── 说明 ──
@@ -85,7 +89,7 @@ public class TerminalActivity extends Activity {
         LinearLayout.LayoutParams olp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 320));
         outScroll.setLayoutParams(olp);
-        outScroll.setBackground(Ui.round(0xFF141418, Ui.STROKE, 10, this));
+        outScroll.setBackground(Ui.inputBg(this));
         int p = Ui.dp(this, 10);
         outScroll.setPadding(p, p, p, p);
         cOut.addView(outScroll);
@@ -105,6 +109,7 @@ public class TerminalActivity extends Activity {
         input.setTextSize(13f);
         input.setTextColor(Ui.TEXT);
         input.setHintTextColor(Ui.SUB);
+        input.setBackground(Ui.inputBg(this));      // 底色随主题（原来吃系统默认下划线）
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         input.setTypeface(android.graphics.Typeface.MONOSPACE);
         input.setImeOptions(EditorInfo.IME_ACTION_GO);

@@ -100,7 +100,15 @@ public class TdshSplashView extends View {
      * 生长是 1.65s（点 0.55 → 线 1.00 → 面 1.65），倒放同样需要这段时间才看得清，
      * 原来只有 0.76s —— 太快，直角还没连成矩形就没了。
      */
-    private static final long COLLAPSE_MS = 1700L;
+    /**
+     * 收尾（collapse）时长。
+     *
+     * <p>2026-10-17 从 1700ms 收到 **1150ms**（用户要求"加快结尾播放速度"）。
+     * 收尾这段是纯等待、不放新信息，压短之后观感更利落；
+     * 真正被切断的原因是揭幕抢跑，那一条在 MainActivity.onServerReady 里
+     * 用 pageOk / endingDone 双条件修掉了。
+     */
+    private static final long COLLAPSE_MS = 1150L;
     /** 收尾时"文字/读数"在整段收尾的前多少比例内淡出干净（之后才轮到几何往回缩）。 */
     private static final float CONTENT_FADE_OUT = 0.25f;
 
@@ -163,7 +171,7 @@ public class TdshSplashView extends View {
         cBG = lightMode ? LIGHT_BG : DARK_BG;
         cINK = lightMode ? LIGHT_INK : DARK_INK;
         cDIM = lightMode ? LIGHT_DIM : DARK_DIM;
-        android.util.Log.i("DSH_SPLASH", "主题: uiMode=" + Integer.toHexString(mode)
+        if (MainActivity.LOG_SHELL) android.util.Log.i("DSH_SPLASH", "主题: uiMode=" + Integer.toHexString(mode)
                 + " DSH覆盖=" + themeOverride + " → " + (lightMode ? "浅色" : "深色")
                 + " 底色=" + Integer.toHexString(cBG));
     }
@@ -309,7 +317,20 @@ public class TdshSplashView extends View {
         if (w <= 0 || h <= 0) return;
 
         // 等比覆盖：两轴同一个缩放倍数（不可能拉伸），铺满整屏（不可能留白）
-        final float s = Math.max(w / LW, h / LH);
+        /*
+         * 尺寸适配（2026-10-18 平板修复）。
+         *
+         * 设计比例 LW:LH = 360:780 ≈ 0.462。
+         *   · 手机 1080:2376 = 0.455，**比设计更窄** → 用 max（cover）以高为准，居中裁 18px，看不出来；
+         *   · 平板 / 横屏 1600:2560 = 0.625，**比设计更宽** → 用 max 会以宽为准，上下被裁掉一截，
+         *     动画顶大字横着出去了 —— 就是“平板未适配”。
+         *
+         * 所以：屏幕比设计更宽时换成 min（contain）并居中，
+         * 保证整幅动画完整可见；其余情况保持原来的 max，
+         * 手机端表现一字不变。
+         */
+        final boolean widerThanDesign = (w / (float) h) > (LW / LH);
+        final float s = widerThanDesign ? Math.min(w / LW, h / LH) : Math.max(w / LW, h / LH);
         cv.save();
         cv.translate((w - LW * s) / 2f, (h - LH * s) / 2f);
         cv.scale(s, s);
@@ -386,7 +407,7 @@ public class TdshSplashView extends View {
         final long nowMs = SystemClock.uptimeMillis();
         if (nowMs - lastDiagAt > 300L) {
             lastDiagAt = nowMs;
-            android.util.Log.i("DSH_SPLASH", String.format(java.util.Locale.ROOT,
+            if (MainActivity.LOG_SHELL) android.util.Log.i("DSH_SPLASH", String.format(java.util.Locale.ROOT,
                     "t=%.3f dot=%.3f line=%.3f face=%.3f halfW=%.1f halfH=%.1f ext=%s pf=%.3f",
                     t, dotA, lineA, faceA, halfW, halfH, external, progressFraction()));
         }

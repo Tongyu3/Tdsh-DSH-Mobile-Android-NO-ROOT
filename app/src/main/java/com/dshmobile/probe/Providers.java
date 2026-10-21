@@ -132,6 +132,11 @@ public final class Providers {
             arr.put(mo);
         }
         o.put("models", arr);
+        // 重试策略（老数据里没有这些键，读的时候用默认值兜住）
+        o.put("retryMode", r.retryMode == null ? "" : r.retryMode);
+        o.put("retryMax", r.retryMax);
+        o.put("retryDelayMs", r.retryDelayMs);
+        o.put("retryMaxDelayMs", r.retryMaxDelayMs);
         return o;
     }
 
@@ -141,6 +146,10 @@ public final class Providers {
         r.name = o.optString("name");
         r.api = o.optString("api", Relay.API_OPENAI_CHAT);
         r.baseUrl = o.optString("baseUrl");
+        r.retryMode = o.optString("retryMode", "");
+        r.retryMax = o.optInt("retryMax", -1);
+        r.retryDelayMs = o.optInt("retryDelayMs", -1);
+        r.retryMaxDelayMs = o.optInt("retryMaxDelayMs", -1);
         JSONArray arr = o.optJSONArray("models");
         for (int i = 0; arr != null && i < arr.length(); i++) {
             JSONObject m = arr.optJSONObject(i);
@@ -329,6 +338,48 @@ public final class Providers {
             out.add(new Relay.Model(id, name == null || name.trim().isEmpty() ? id : name.trim(), false));
         }
         return out;
+    }
+
+    /**
+     * 测一次**官方 API**（{@code https://api.deepseek.com}）能不能用。
+     *
+     * <p>为什么直接测官方、而不是复用 {@link #discover}：官方那家由 DSH 自带的
+     * 适配器提供（provider 名 {@code deepseek-official}），它的地址与协议**不在**
+     * 我们写的 {@code llm-pi-ai.providers} 里，所以没有 route 对象可传。
+     * 这里按官方文档的 {@code GET /models} 打一发，只要 200 就说明
+     * "密钥有效 + 网络通 + 地址对" —— 这三件事正是用户"爆红"时要区分的。
+     *
+     * @return 成功时给人看的一句话（含可用模型数）
+     * @throws Exception 失败时抛出**已经翻译成人话**的原因（{@link Relay#explainOfficialError}）
+     */
+    public static String testOfficial(String apiKey) throws Exception {
+        String key = apiKey == null ? "" : apiKey.trim();
+        if (key.isEmpty()) throw new IllegalStateException("还没填官方 API Key");
+        HttpURLConnection conn = null;
+        int code = 0;
+        String body = "";
+        try {
+            conn = (HttpURLConnection) new URL(Relay.OFFICIAL_BASE + "/models").openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(12000);
+            conn.setReadTimeout(20000);
+            conn.setRequestProperty("Authorization", "Bearer " + key);
+            code = conn.getResponseCode();
+            body = readAll(code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream(),
+                    256 * 1024);
+        } catch (java.io.IOException io) {
+            // 连 DNS 都没解析出来也走这里 —— code=0 在 explain 里就是"检查网络"
+            throw new IllegalStateException(Relay.explainOfficialError(0,
+                    io.getMessage() == null ? "" : io.getMessage()));
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+        if (code < 200 || code >= 300) throw new IllegalStateException(Relay.explainOfficialError(code, body));
+        int n = 0;
+        try {
+            n = parseModelList(body).size();
+        } catch (Throwable ignore) { /* 数不出来不影响"能连上"这个结论 */ }
+        return "官方 API 正常（HTTP 200" + (n > 0 ? "，看到 " + n + " 个模型" : "") + "）";
     }
 
     private static String readAll(InputStream in, int max) {

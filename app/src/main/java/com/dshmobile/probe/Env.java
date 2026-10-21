@@ -24,8 +24,14 @@ import java.nio.charset.StandardCharsets;
  */
 public final class Env {
 
-    /** Node 的安装目录名（解压在容器 /opt 下）。 */
-    public static final String NODE_DIR = "node-v22.23.2-linux-arm64";
+    /**
+     * Node 的安装目录名（解压在容器 /opt 下）。
+     *
+     * <p>真源在 {@link NodeInfo} —— 那边**不依赖 Android**，所以纯逻辑类
+     * （{@code ProcCleanup}）可以引用它而不把 Android 拖进离线自检。
+     * 这里保留一个同名别名，是免得改所有既有引用点。
+     */
+    public static final String NODE_DIR = NodeInfo.NODE_DIR;
     /** dsh web 的监听端口（回环）。 */
     public static final int DSH_PORT = 3080;
 
@@ -79,6 +85,31 @@ public final class Env {
      * 若想让工作区变成整个共享存储，把这里改成 SDCARD_GUEST 即可。
      */
     public static final String WORKSPACE = SDCARD_GUEST + "/" + TEST_DIR_NAME;
+
+    /**
+     * App 私有目录挂进容器后的路径（用户要求："能让 dsh 访问软件私有目录"）。
+     *
+     * <h3>为什么要这么做，以及为什么不用 Shizuku</h3>
+     * 容器里访问不到 {@code /data/data/com.dshmobile.probe/} —— **不是权限问题，
+     * 是 proot 没有挂载它**。PRoot 官方语义：未绑定的宿主路径在 guest 里根本不存在
+     * （典型表现是 "No such file or directory"，而不是 EACCES）。
+     *
+     * <p>所以解法就是这里一行 {@code -b}，**零提权**：进程的真实 uid 就是 App 自己、
+     * SELinux 上下文也是它自己的，访问自己的 filesDir 内核本来就允许；
+     * proot 的 {@code -0} 只是伪装身份，不做提权。
+     *
+     * <p>反过来，**用 Shizuku（uid 2000）去读私有目录是做不到的**：
+     * DAC（/data/data/&lt;pkg&gt; 是 0700，且 /data/data 不让 shell 穿越）加上
+     * SELinux 的 per-app MLS category（{@code app_data_file} 带只有该 App 才持有的
+     * category，shell 域不持有 → allow 规则在 MLS 层根本不匹配）。
+     * 所以 {@code chmod 0771} 没用，而"为了给 shell 开洞把私有目录变全局可读"
+     * 本身就是错的 —— 那会连 API Key、容器 rootfs、会话日志一起暴露。
+     *
+     * <p>刻意**不绑整个 /data**：DSH 跑在 danger-full-access 下，
+     * 绑整个 /data 只会给它一堆"看着在、打不开"的路径（别的应用的私有目录），
+     * 白烧 token 又没有任何用处。
+     */
+    public static final String APPDATA_GUEST = "/app-data";
 
     /** 手机控制 CLI 在容器里的安装位置。 */
     public static final String PHONE_CLI_PATH = "/usr/local/bin/phone";
@@ -374,6 +405,11 @@ public final class Env {
         if (phoneTokenDir != null && !phoneTokenDir.isEmpty()) {
             a.add("-b"); a.add(phoneTokenDir + ":" + PHONE_RUN_DIR);
         }
+        /*
+         * App 私有目录（见 APPDATA_GUEST 的说明）：一行 bind，零提权。
+         * 挂在 /app-data 而不是 /data —— 别把整个 /data 递进去。
+         */
+        a.add("-b"); a.add(base.getAbsolutePath() + ":" + APPDATA_GUEST);
         a.add("/usr/bin/env"); a.add("-i");
         a.add("HOME=/root");
         a.add("PATH=" + nodePath + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
@@ -521,7 +557,7 @@ public final class Env {
      * 用它判重的话，App 升级带了新插件也永远会被当成"已安装、跳过"，
      * 用户就再也拿不到插件的更新了。
      */
-    public static final String PHONE_PLUGIN_TGZ = "dsh-phone-1.0.2.tgz";
+    public static final String PHONE_PLUGIN_TGZ = "dsh-phone-1.0.4.tgz";
     /** 右侧栏「手机文件」插件（浏览手机存储 + 多选加进会话）。 */
     public static final String PHONE_FILES_TGZ = "dsh-phone-files-1.0.2.tgz";
     public static final String PHONE_FILES_NAME = "dsh-phone-files";
@@ -534,8 +570,26 @@ public final class Env {
      * <p>它只负责让 DSH 里的 agent 会调虚拟屏（取帧/点按/放应用上屏），
      * 真正的两个 dex 在 {@code assets/vsd/}，由「手机权限 → 虚拟屏自动化」装起来。
      */
-    public static final String VSCREEN_TGZ = "dsh-vscreen-1.0.0.tgz";
+    public static final String VSCREEN_TGZ = "dsh-vscreen-1.1.0.tgz";
     public static final String VSCREEN_NAME = "dsh-vscreen";
+    /**
+     * 环境预设插件：往 systemPrompt 里注入"你在安卓手机上、在 proot 容器里"那段。
+     *
+     * <p>解决的是"模型以为自己在服务器上"这类反复出现的错（用 systemctl、
+     * 以为有 GUI、以为 apt 能拿到真 root、不知道 phone_* 工具存在）。
+     */
+    public static final String ANDROID_ENV_TGZ = "dsh-android-env-1.0.0.tgz";
+    public static final String ANDROID_ENV_NAME = "dsh-android-env";
+
+    /**
+     * 思考链插件：**探针 + 只读诊断**。
+     *
+     * <p>刻意不提供"一键删思考链"的开关 —— 上一轮实测证明包 {@code llm.stream}
+     * 那条路是死的（插件看到的是门面，适配器那层拦不到）。先探明真正可用的钩子，
+     * 再谈实现；在那之前给开关只会让人以为它在生效。
+     */
+    public static final String THINKING_TGZ = "dsh-thinking-1.0.1.tgz";
+    public static final String THINKING_NAME = "dsh-thinking";
     /**
      * 随 APK 内置的插件：{tarball 名, 包名}。
      * 加新插件只要在这里追加一行 + 跑 plugin\build-tgz.ps1。
@@ -545,6 +599,8 @@ public final class Env {
             { PHONE_FILES_TGZ, PHONE_FILES_NAME },
             { DSLINK_TGZ, DSLINK_NAME },
             { VSCREEN_TGZ, VSCREEN_NAME },
+            { ANDROID_ENV_TGZ, ANDROID_ENV_NAME },
+            { THINKING_TGZ, THINKING_NAME },
     };
 
     /**
@@ -571,6 +627,35 @@ public final class Env {
         if (!pkgJson.exists()) {
             return "profile 还没建好，本次跳过（下次启动再装）";
         }
+        /*
+         * ── 快速跳过（2026-10-21，用户报"插件装多了启动特别慢"）──
+         *
+         * 判据改成**三样同时成立**才跳过：本版已装过 + 目录都在 + package.json 里
+         * 那几条 file: 依赖也都在。这样既不会重复解包（几十个文件写盘），
+         * 也不会因为 DSH 自己把 package.json 改写掉而误判成"已装好"。
+         *
+         * 为什么值得单独做：`readText(pkgJson)` 原来在循环里被调了 6 次，
+         * 而且**每次启动**都会跑一遍；插件一多，光这一项就是几百毫秒的启动时间。
+         */
+        String pkgText = null;
+        try {
+            pkgText = readText(pkgJson);
+            int vc = c.getPackageManager().getPackageInfo(c.getPackageName(), 0).versionCode;
+            boolean markerOk = c.getSharedPreferences(DshService.PREFS, Context.MODE_PRIVATE)
+                    .getInt(KEY_BUNDLED_PLUGIN_VC, -1) == vc;
+            if (markerOk && pkgText != null) {
+                boolean all = true;
+                for (String[] spec : BUNDLED_PLUGINS) {
+                    if (!pkgText.contains(spec[0])
+                            || !new File(profileDir, "node_modules/" + spec[1]).isDirectory()) {
+                        all = false;
+                        break;
+                    }
+                }
+                if (all) return "自带插件已装（第 " + vc + " 版），本次跳过";
+            }
+        } catch (Throwable ignore) { }
+
         StringBuilder log = new StringBuilder("自带插件：");
         for (String[] spec : BUNDLED_PLUGINS) {
             String tgzName = spec[0], pkgName = spec[1];
@@ -651,7 +736,87 @@ public final class Env {
                 log.append(pkgName).append(" 失败: ").append(t).append("；");
             }
         }
+        /*
+         * 记下"本版本已经装过了"，下次启动直接走快速跳过。
+         * 只在**整轮没出错**时写入：某个插件装失败的话，下次还要重试。
+         */
+        try {
+            if (log.indexOf("失败") < 0) {
+                int vc = c.getPackageManager().getPackageInfo(c.getPackageName(), 0).versionCode;
+                c.getSharedPreferences(DshService.PREFS, Context.MODE_PRIVATE)
+                        .edit().putInt(KEY_BUNDLED_PLUGIN_VC, vc).apply();
+            }
+        } catch (Throwable ignore) { }
         return log.toString();
+    }
+
+    /** 自带插件的"本版本已装过"标记键（见 {@link #installPhonePlugin}）。 */
+    private static final String KEY_BUNDLED_PLUGIN_VC = "bundled_plugin_vc";
+
+    /**
+     * 把「桌宠」插件从容器里摘掉 —— 它的宿主已经被删了，留着只会白烧电。
+     *
+     * <h3>为什么必须做（2026-10-21 用户报"用久了发烫"）</h3>
+     * 桌宠的显示层（{@code PetOverlayHost}）已经按用户要求删掉了，但**插件本身还在容器里**：
+     * 它每隔一两百毫秒改一次 {@code /sdcard/.dsh-phone/pet-overlay.json}，等宿主来读。
+     * 宿主没了，这些写盘就全是白费 —— 而每一次写都要穿过 proot（ptrace 拦截，
+     * 系统调用成本约 3 倍），正好是持续发热的来源之一。
+     * 实测证据：每次 DSH 启动后那份 json 的修改时间都会刷新。
+     *
+     * <p>所以从 profile 的 {@code dependencies} 与 {@code dsh.profile.bundles} 里摘掉
+     * {@code dsh-pet*} 这两个字段。**只动这两个名字**，别的插件一个不碰；
+     * 改之前把原文件备份成 {@code package.json.bak-pet}，用户想恢复随时能恢复。
+     *
+     * @return 给人看的一句话；没什么可做时返回 null
+     */
+    public static String disablePetPlugin(File base) {
+        File profileDir = new File(base, "rootfs/root/.dsh/profiles/web");
+        File pkgJson = new File(profileDir, "package.json");
+        if (!pkgJson.exists()) return null;
+        try {
+            String text = readText(pkgJson);
+            org.json.JSONObject o = new org.json.JSONObject(text);
+            boolean changed = false;
+
+            org.json.JSONObject deps = o.optJSONObject("dependencies");
+            if (deps != null) {
+                java.util.List<String> drop = new java.util.ArrayList<>();
+                java.util.Iterator<String> it = deps.keys();
+                while (it.hasNext()) {
+                    String k = it.next();
+                    if (k.contains("dsh-pet")) drop.add(k);
+                }
+                for (String k : drop) { deps.remove(k); changed = true; }
+            }
+
+            org.json.JSONObject dsh = o.optJSONObject("dsh");
+            org.json.JSONObject profile = dsh == null ? null : dsh.optJSONObject("profile");
+            org.json.JSONArray bundles = profile == null ? null : profile.optJSONArray("bundles");
+            if (bundles != null) {
+                org.json.JSONArray keep = new org.json.JSONArray();
+                for (int i = 0; i < bundles.length(); i++) {
+                    String n = bundles.optString(i, "");
+                    if (n.contains("dsh-pet")) { changed = true; continue; }
+                    keep.put(n);
+                }
+                if (changed) profile.put("bundles", keep);
+            }
+            if (!changed) return null;
+
+            // 备份（只在第一次覆盖时留，别把原备份冲掉）
+            File bak = new File(profileDir, "package.json.bak-pet");
+            if (!bak.exists()) {
+                try (java.io.OutputStream os = new java.io.FileOutputStream(bak)) {
+                    os.write(text.getBytes(StandardCharsets.UTF_8));
+                }
+            }
+            try (java.io.OutputStream os = new java.io.FileOutputStream(pkgJson)) {
+                os.write(o.toString(2).getBytes(StandardCharsets.UTF_8));
+            }
+            return "已从容器里摘掉桌宠插件（省电；原配置备份在 package.json.bak-pet）";
+        } catch (Throwable t) {
+            return "摘桌宠插件失败（不影响其它功能）：" + t;
+        }
     }
 
     // ══════════ 插件自救：停用某个插件 / 安全模式 ══════════
@@ -805,6 +970,122 @@ public final class Env {
             for (int i = 0; b != null && i < b.length(); i++) out.add(b.optString(i));
         } catch (Throwable ignore) { }
         return out;
+    }
+
+    /**
+     * 从**磁盘上**找出所有可能是"肇事者"的第三方插件名字。
+     *
+     * <h3>为什么不能只看 profile.bundles（真机事故）</h3>
+     * 用户（小米 25091RP04C）装了个插件之后 App 直接进不去。日志里点名的是
+     * `dsh-agnes-multimodal-fixed`，但那个名字**不在 profile.bundles 里** ——
+     * 它是通过 `cordis.patch.yml` 或别的路径被加载的。
+     * 结果自动自救连续两次都"停用 0 个"（因为 {@link #disableBundles} 当时只认
+     * bundles 里的名字），撞到上限后放弃，用户就一直卡在报错页。
+     *
+     * <p>所以这里把"可能加载插件的三个地方"都扫一遍：
+     * <ol>
+     *   <li>profile 的 `package.json` → `dsh.profile.bundles`（正常安装的插件在这里）；</li>
+     *   <li>`cordis.patch.yml` 全文里的插件名（正则捞 `@scope/name` 与 `dsh-xxx`）；</li>
+     *   <li>`node_modules/` 下的实际包目录（前面两处都没登记、但文件确实躺在那儿）。</li>
+     * </ol>
+     * 官方包与自带插件（{@link #SAFE_BUNDLES}）一律排除 —— 停它们没有意义。
+     *
+     * <p>纯文件读取，不改任何东西；调用方决定要停谁。
+     */
+    public static java.util.List<String> discoverThirdParty(Context c) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        try {
+            // ① profile.bundles
+            for (String b : profileBundles(c)) if (!isSafeBundle(b)) out.add(b);
+
+            // ② cordis.patch.yml 里出现的**包名** + 每个条目的 **id**
+            //
+            // 为什么 id 也要收：有的插件是 `- id: agnes-multimodal` 这样挂进来的，
+            // id 里没有包名，只按包名过滤会漏掉它 —— 而漏掉就是"重启多少次都没用"。
+            // `llm-pi-ai` 是我们自己写的中转站条目，绝不能停（摘了模型配置就没了）。
+            try {
+                File patch = profilePatch(c);
+                if (patch.exists()) {
+                    String yml = readText(patch);
+                    for (String n : PluginMsg.pluginNamesIn(yml, safeBundles())) {
+                        out.add(n);
+                    }
+                    for (String id : PluginMsg.entryIdsIn(yml)) {
+                        if (Relay.PI_AI_ENTRY_ID.equals(id)) continue;   // 中转站那条，永远不动
+                        if (!isSafeBundle(id)) out.add(id);
+                    }
+                }
+            } catch (Throwable ignore) { }
+
+            // ③ node_modules 下的实际目录
+            //
+            // ⚠️ 这里**必须**用 looksLikeDshPlugin 过滤，不能"见到目录就当插件"。
+            // 上一版就是那样：第三方插件自带的**普通依赖**（lodash 之类）也会被当成
+            // "插件"收进来，于是面板上冒出几百个根本不是插件的东西。
+            // 用户报的"怎么这么多插件"里，这是 App 侧唯一能产生大数字的地方
+            // （另一个"200 多个"是 DSH 自己的官方依赖包，见 docs/第三方插件清单.md）。
+            try {
+                File nm = new File(profilePkg(c).getParentFile(), "node_modules");
+                File[] kids = nm.listFiles();
+                if (kids != null) {
+                    for (File k : kids) {
+                        String n = k.getName();
+                        if (n.startsWith(".")) continue;            // .bin / .dsh-disabled / .pnpm
+                        if (n.startsWith("@")) {                     // scope 目录
+                            File[] sub = k.listFiles();
+                            if (sub == null) continue;
+                            for (File s : sub) {
+                                String full = n + "/" + s.getName();
+                                if (isSafeBundle(full)) continue;
+                                if (looksLikeDshPlugin(s)) out.add(full);
+                            }
+                        } else if (!isSafeBundle(n) && looksLikeDshPlugin(k)) {
+                            out.add(n);
+                        }
+                    }
+                }
+            } catch (Throwable ignore) { }
+        } catch (Throwable ignore) { }
+        return new java.util.ArrayList<>(out);
+    }
+
+    /**
+     * 这个 node_modules 目录到底是不是一个 **DSH 插件**。
+     *
+     * <p>判据（任一成立即可，全部来自 DSH 的发布约定）：
+     * <ul>
+     *   <li>{@code keywords} 里有 {@code dsh-plugin} —— 官方发现机制就是找这个标签；</li>
+     *   <li>声明了 {@code dsh.bundle}（host 侧 patch）；</li>
+     *   <li>声明了 {@code dsh.client}（浏览器侧注入）。</li>
+     * </ul>
+     *
+     * <p>为什么要判：第三方插件会把自己的普通依赖装进**同一个** node_modules，
+     * 那些包不是插件，不该出现在插件管理里，更不该被安全模式当成可疑对象。
+     */
+    private static boolean looksLikeDshPlugin(File dir) {
+        try {
+            File pj = new File(dir, "package.json");
+            if (!pj.isFile() || pj.length() > 512 * 1024) return false;
+            String t = readText(pj);
+            if (t == null) return false;
+            org.json.JSONObject o = new org.json.JSONObject(t);
+            org.json.JSONArray kw = o.optJSONArray("keywords");
+            for (int i = 0; kw != null && i < kw.length(); i++) {
+                if ("dsh-plugin".equals(kw.optString(i))) return true;
+            }
+            org.json.JSONObject dsh = o.optJSONObject("dsh");
+            return dsh != null && (dsh.has("bundle") || dsh.has("client"));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 是不是"官方包 / 自带插件"（这些不该被安全模式停掉）。 */
+    private static boolean isSafeBundle(String name) {
+        if (name == null || name.isEmpty()) return true;
+        for (String s : SAFE_BUNDLES) if (s.equals(name)) return true;
+        // 官方两个包的任何子路径也算官方
+        return name.startsWith("@deepseek-ai/");
     }
 
     /** 被我们停用的 bundle（存 App 的 prefs，不往 DSH 的配置里塞自定义字段）。 */
@@ -1107,7 +1388,27 @@ public final class Env {
                 String name = b.optString(i);
                 if (names.contains(name)) off.add(name); else keep.add(name);
             }
-            if (off.isEmpty()) return 0;
+
+            /*
+             * ⚠️ 关键修复（2026-10-05）：**除了 bundles 里点名的，还要处理"只在别处被引用"的插件**。
+             *
+             * 原来的写法是 `if (off.isEmpty()) return 0;` —— 也就是"这个名字不在 profile.bundles
+             * 里就什么都不做"。真机事故（小米 25091RP04C，用户装插件后直接进不去）：
+             * 肇事插件是通过 `cordis.patch.yml` / 别的路径被加载的，压根不在 bundles 里，
+             * 于是自动自救连续两次都"停用 0 个"，撞到上限后彻底放弃，用户就一直卡在报错页。
+             *
+             * 现在按两部分处理，**互不依赖**：
+             *   · off     —— 在 bundles 里 → 从 bundles/dependencies 摘掉（原声明记下来）；
+             *   · alsoOff —— 不在 bundles 里，但**名字是我们确认该停的** → 只挪包目录。
+             * 挪目录这一招不依赖任何配置文件，只要包目录不在了，它就没法被加载。
+             */
+            java.util.List<String> alsoOff = new java.util.ArrayList<>();
+            for (String n : names) {
+                if (!off.contains(n) && !keep.contains(n)) alsoOff.add(n);
+            }
+            if (off.isEmpty() && alsoOff.isEmpty()) return 0;
+            java.util.List<String> allOff = new java.util.ArrayList<>(off);
+            allOff.addAll(alsoOff);
 
             org.json.JSONArray nb = new org.json.JSONArray();
             for (String k : keep) nb.put(k);
@@ -1125,25 +1426,67 @@ public final class Env {
             org.json.JSONObject deps = o.optJSONObject("dependencies");
             File nodeModules = new File(profilePkg(c).getParentFile(), "node_modules");
             File grave = new File(nodeModules, ".dsh-disabled");
-            for (String n : off) {
+            for (String n : allOff) {
                 try {
                     if (deps != null && deps.has(n)) { specs.put(n, deps.optString(n)); deps.remove(n); }
                     File from = new File(nodeModules, n);
                     if (from.exists()) {
+                        File to = new File(grave, n);
+                        File toParent = to.getParentFile();
+                        if (toParent != null && !toParent.exists()) //noinspection ResultOfMethodCallIgnored
+                            toParent.mkdirs();
                         if (!grave.exists()) //noinspection ResultOfMethodCallIgnored
                             grave.mkdirs();
-                        File to = new File(grave, n);
                         deleteRecursively(to);
                         boolean moved = from.renameTo(to);
                         android.util.Log.i("DSH_SAFEMODE", "挪走包目录 " + n + " → " + moved
                                 + " [源还在=" + from.exists() + " 目标目录在=" + to.exists()
                                 + " 目标含package.json=" + new File(to, "package.json").exists() + "]");
                     } else {
-                        android.util.Log.i("DSH_SAFEMODE", "包目录不存在（只改配置）：" + n);
+                        /*
+                         * 包目录不在 —— 这**不代表没事**。
+                         * `cordis.patch.yml` 里 `- insert:` 进来的插件就是这样：
+                         * 它根本不是 node_modules 里的包，所以"挪目录"对它无效，
+                         * 只能靠下面那段"摘配置"处理（群友笔记第 43 行点名的正是这个缺口）。
+                         */
+                        android.util.Log.i("DSH_SAFEMODE", "包目录不存在（交给摘配置处理）：" + n);
                     }
                 } catch (Throwable e2) {
                     android.util.Log.w("DSH_SAFEMODE", "挪走失败 " + n, e2);
                 }
+            }
+
+            /*
+             * ★ 关键补上的一步：**从 cordis.patch.yml 里摘掉这些条目**。
+             *
+             * 只挪 node_modules 目录是不够的 —— 通过 patch 文件 `- insert:` 挂进来的插件
+             * 根本不在 node_modules 里，挪目录对它完全无效，于是每次冷启动都重复同一个错，
+             * 用户"重启多少次都没用"（群友笔记里写得很清楚）。
+             *
+             * 摘之前**先备份**：改错了要能一键回到原样，这是用户唯一的路由配置文件。
+             */
+            try {
+                File patch = profilePatch(c);
+                if (patch.exists()) {
+                    String before = readText(patch);
+                    String after = PluginMsg.stripEntries(before, allOff);
+                    if (!after.equals(before)) {
+                        File bak = new File(patch.getParentFile(),
+                                "cordis.patch.yml.bak-" + System.currentTimeMillis());
+                        try (OutputStream bos = new FileOutputStream(bak)) {
+                            bos.write(before.getBytes(StandardCharsets.UTF_8));
+                        }
+                        try (OutputStream os = new FileOutputStream(patch)) {
+                            os.write(after.getBytes(StandardCharsets.UTF_8));
+                        }
+                        android.util.Log.i("DSH_SAFEMODE",
+                                "已从 cordis.patch.yml 摘掉引用这些插件的条目；备份=" + bak.getName());
+                    } else {
+                        android.util.Log.i("DSH_SAFEMODE", "cordis.patch.yml 里没有这些插件的条目，未改动");
+                    }
+                }
+            } catch (Throwable e3) {
+                android.util.Log.w("DSH_SAFEMODE", "摘 cordis.patch.yml 条目失败", e3);
             }
             try {
                 /*
@@ -1170,11 +1513,11 @@ public final class Env {
             }
 
             java.util.List<String> dis = disabledBundles(c);
-            for (String x : off) if (!dis.contains(x)) dis.add(x);
+            for (String x : allOff) if (!dis.contains(x)) dis.add(x);
             setDisabled(c, dis);
-            android.util.Log.i("DSH_SAFEMODE", "停用成功 off=" + off + " 剩余=" + keep
-                    + " 待恢复=" + dis);
-            return off.size();
+            android.util.Log.i("DSH_SAFEMODE", "停用成功 bundles内=" + off + " 仅挪目录=" + alsoOff
+                    + " 剩余bundle=" + keep + " 待恢复=" + dis);
+            return allOff.size();
         } catch (Throwable t) {
             android.util.Log.w("DSH_SAFEMODE", "停用失败", t);
             return 0;

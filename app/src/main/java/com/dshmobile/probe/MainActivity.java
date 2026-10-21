@@ -67,10 +67,55 @@ public class MainActivity extends Activity {
     /** 初始化失败时才出现的「重试」；长按 = 清空容器重新初始化。 */
     private TextView retryButton;
     /** 顶部状态栏整行；DSH 就绪后会整条隐藏，避免常年遮挡视野。 */
+    /**
+     * 开屏 / 窗口日志开关。
+     *
+     * <p>正式包里每帧都在打 DSH_SPLASH 日志（开屏期 60fps），
+     * 既费电又把内部路径写进 logcat。要调开屏时改成 true即可。
+     */
+    static final boolean LOG_SHELL = false;
+
     private LinearLayout topBar;
+    /**
+     * 内容容器（工具条 + WebView 那一坨）。
+     *
+     * <p>为什么要留着引用：安全区内边距**只能加在它身上**。
+     * 第一版加在 decor 的子 View 上，而 splash 是孙节点，结果开屏也被推下去、
+     * 顶部空出一条 —— 用户截图里那条深色带就是它。开屏必须始终铺满整屏。
+     */
+    private LinearLayout contentRoot;
     private WebView webView;
     /** 开屏动画（工业简约风）。见 {@link TdshSplashView} 与 {@link #dismissSplash()}。 */
     private TdshSplashView splash;
+    /**
+     * 开屏快照（用户要求「开屏秒显」）。
+     *
+     * <p>冷启动实测 11.24 秒，其中 7.6 秒是容器 + Node 内核 + 插件加载，这段**没法缩短**
+     * （见 START_TIMING 日志）。但用户不必盯着开屏动画看 —— 上次退出时的界面已经存成了
+     * 一张 PNG，启动时立刻贴出来，等服务就绪、页面真正加载完再淡出。
+     * 视觉上就是"App 已经在那儿了"，而不是"又在转圈等 11 秒"。
+     *
+     * <p>为什么是静态图而不是保留 WebView 进程：Android 在系统回收时不会让我们留住
+     * WebView；而一张 PNG 不到 200KB，画出来是零成本的。
+     */
+    private android.widget.ImageView snapshotView;
+    /** 快照的最大有效期 —— 太旧的界面反而是误导（会话可能早就变了）。 */
+    private static final long SNAPSHOT_MAX_AGE_MS = 7L * 24 * 3600 * 1000;
+    /**
+     * "揭幕"动作 —— 由 {@link #onServerReady} 设好、由 {@code onPageFinished} 触发。
+     *
+     * <p>有了它，开屏就不必"收尾播完先露出一张空白页、再等 DSH 自己转圈"：
+     * 页面真正画出来了才揭开，DSH 的加载转圈全程藏在开屏底下。
+     */
+    private volatile Runnable pageReveal;
+    /**
+     * 揭幕的兜底等待上限。
+     *
+     * <p>不能只靠 onPageFinished —— 页面白屏/加载失败时它可能永远不来，
+     * 那开屏就成了永久封面，比转圈更糟（用户点都点不进去）。
+     * 4 秒足够覆盖实测的 3.6 秒加载，超了就强制揭开、让用户看到真实页面。
+     */
+    private static final long PAGE_REVEAL_MAX_MS = 4000;
     /** 开屏是从什么时候开始显示的 —— 用来保证"至少露一下脸"，不做无谓闪烁。 */
     private long splashShownAt = 0L;
     /**
@@ -170,23 +215,259 @@ public class MainActivity extends Activity {
             } else {
                 decor.setSystemUiVisibility(0);
             }
-            android.util.Log.i("DSH_SPLASH", "窗口外观: " + (lightMode ? "浅色" : "深色")
+            /*
+             * ⚠️ **开屏期：占满整屏；进主页后：交回系统排版**（2026-10-17 定稿）。
+             *
+             * 之前两个"半边"做法都错：
+             *   · 全程关掉 decorFitsSystemWindows → 主页内容要人工补内边距，
+             *     补少了压状态栏、补多了空一大截，每轮重装试；
+             *   · 全程不关 → 开屏够不到屏幕最底，底部露出导航栏那条深色（用户截图）。
+             *
+             * 正解是按阶段切：开屏这一段让窗口内容铺满（含导航栏区），
+             * 进主页由 restoreWindowChrome() 把 true 放回去。全程零人工内边距。
+             */
+            win.setStatusBarColor(android.graphics.Color.TRANSPARENT);
+            win.setNavigationBarColor(android.graphics.Color.TRANSPARENT);
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                win.setDecorFitsSystemWindows(false);
+            } else {
+                decor.setSystemUiVisibility(
+                        android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                      | android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                      | android.view.View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                      | (lightMode ? android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR : 0));
+            }
+            /*
+             * 开屏期：**隐藏状态栏**，让动画真正铺满整屏（用户要求）。
+             * 主页阶段由 restoreWindowChrome() 恢复回去，两段互不干扰。
+             */
+            hideStatusBarForSplash();
+            applyCutoutInsets(decor);
+            if (LOG_SHELL) android.util.Log.i("DSH_SPLASH", "窗口外观: " + (lightMode ? "浅色" : "深色")
                     + " 开屏底色=" + Integer.toHexString(bg) + " 状态栏透明+内容延伸");
         } catch (Throwable e) {
             android.util.Log.w("DSH_SPLASH", "设置窗口外观失败", e);
         }
     }
 
+    /**
+     * 内容区的上下内边距 —— **只能由 {@link #applyContentPadding()} 一个地方写**。
+     *
+     * <h3>为什么要收成一个地方（2026-10-18）</h3>
+     * 之前两处各写各的：
+     * <ul>
+     *   <li>输入法监听器写：{@code setPadding(0, getPaddingTop(), 0, ime)}</li>
+     *   <li>安全区那边写：{@code setPadding(0, 0, 0, 0)} —— 把前者直接清零</li>
+     * </ul>
+     * 而弹键盘本身就是一次焦点变化，会调 {@code onWindowFocusChanged} → 安全区那边跑一遍，
+     * 两者是竞争关系，顺序一变就出错。现在两边只存值，
+     * 真正写 padding 的只有这一个方法。
+     */
+    private int insTop = 0;      // 安全区顶部（已扣除 DSH 头部自带内边距）
+    private int insBottom = 0;   // 输入法 / 导航栏占的底部
+
+    /** 把上下两个值合并写进 contentRoot；任一值变化都走这里。 */
+    private void applyContentPadding() {
+        if (contentRoot == null) return;
+        contentRoot.setPadding(0, insTop, 0, insBottom);
+    }
+
     /** 开屏收起后，把系统栏交还给系统默认表现。 */
+    /**
+     * 监听输入法高度，把内容压短到键盘上沿。
+     *
+     * <p>API 30+ 用 {@code WindowInsets.Type.ime()}  + navigationBars 取较大值；
+     * 老机型用 {@code getSystemWindowInsetBottom()} 回退。
+     * 两者都是“输入法占了多少底部空间”的同一个量。
+     */
+    private void decorPostInsets() {
+        try {
+            final android.view.View decor = getWindow().getDecorView();
+            decor.setOnApplyWindowInsetsListener((v, insets) -> {
+                int bottom;
+                if (android.os.Build.VERSION.SDK_INT >= 30) {
+                    bottom = Math.max(
+                            insets.getInsets(android.view.WindowInsets.Type.ime()).bottom,
+                            insets.getInsets(android.view.WindowInsets.Type.navigationBars()).bottom);
+                } else {
+                    bottom = insets.getSystemWindowInsetBottom();
+                }
+                insBottom = bottom;
+                applyContentPadding();
+                return insets;
+            });
+            decor.requestApplyInsets();
+        } catch (Throwable ignore) { }
+    }
+
     private void restoreWindowChrome() {
         try {
             android.view.Window win = getWindow();
             win.clearFlags(android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
             win.setStatusBarColor(android.graphics.Color.TRANSPARENT);
             win.setNavigationBarColor(android.graphics.Color.TRANSPARENT);
-            android.util.Log.i("DSH_SPLASH", "窗口外观: 已交还系统");
+            /*
+             * 开屏结束 → **继续保持全屏沉浸**，不把排版交回系统。
+             *
+             * 上一版这里做了 setDecorFitsSystemWindows(true) + showStatusBarAfterSplash()，
+             * 结果两个问题：
+             *   ① 这个方法在服务就绪时就被调用，而 Tdsh 收尾动画还在播
+             *      → 动画期间状态栏"长"出来，把画面往下挤；
+             *   ② 系统把内容整体推到状态栏下方 114px，顶部留白过大。
+             * 现在只清 FLAG_LAYOUT_NO_LIMITS，并**再确保藏一次**状态栏，
+             * 防止别的路径把它放回来。
+             */
+            /*
+             * 进主页 → **状态栏回来**（透明），并保持 edge-to-edge。
+             *
+             * QQ / DeepSeek 的做法不是隐藏状态栏，也不是在原生侧垫一条 padding，而是：
+             *   · 状态栏常驻且透明；
+             *   · 页面自己的背景一直画到屏幕最顶（状态栏底下）——所以永远不会有接缝；
+             *   · 页面内容由网页自己让开状态栏（patch.js 里给 body 加 padding-top）。
+             * 这样原生侧不用算任何内边距，也不会出现“垫条颜色不对”。
+             */
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                win.setDecorFitsSystemWindows(false);
+            }
+            showStatusBarAfterSplash();
+            if (LOG_SHELL) android.util.Log.i("DSH_SPLASH", "窗口外观: edge-to-edge + 透明状态栏常驻");
         } catch (Throwable ignore) { }
     }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        /*
+         * 在这里再补一次安全区：`applyWindowChrome()` 执行时窗口还没 attached，
+         * getRootWindowInsets() 常返回 null（实测就是这条导致第一版没生效）。
+         * onWindowFocusChanged 时窗口一定已经挂上、insets 已下发。
+         * 幂等：只是重设一次 padding，重复调用无副作用。
+         */
+        if (hasFocus) {
+            try { applyCutoutInsets(getWindow().getDecorView()); } catch (Throwable ignore) { }
+        }
+    }
+
+    /**
+     * 处理刘海/挖孔：让内容延伸到全屏，但把关键内容的左右上边距推开。
+     *
+     * <p>不处理的话，全屏后刘海会盖住 DSH 页面顶部那一行（标题/返回按钮）。
+     * 这里只在"有刘海"时给根容器补 padding，没刘海（padding 为 0）就不动，
+     * 避免把所有机型的布局都往下压。
+     */
+    /**
+     * 开屏期隐藏状态栏（只藏状态栏，不动导航栏）。
+     *
+     * <p>为什么不是 hide(statusBars|navigationBars)：底部手势条藏掉会让页面在
+     * 开屏→主页切换时整体高度跳一次，肉眼可见。只藏顶部就够让动画满屏。
+     */
+    private void hideStatusBarForSplash() {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                android.view.WindowInsetsController c = getWindow().getInsetsController();
+                if (c != null) {
+                    c.hide(android.view.WindowInsets.Type.statusBars());
+                    c.setSystemBarsBehavior(
+                            android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                }
+            } else {
+                android.view.View d = getWindow().getDecorView();
+                d.setSystemUiVisibility(d.getSystemUiVisibility()
+                        | android.view.View.SYSTEM_UI_FLAG_FULLSCREEN);
+            }
+        } catch (Throwable ignore) { }
+    }
+
+    /**
+     * 开屏结束 → 把状态栏放回来。
+     *
+     * <p>放回后依旧是**透明 + 深色图标**（见 applyWindowChrome 的说明），
+     * 所以主页那一条和页面同色，不会因为"藏过又出现"而闪一下白色横条。
+     */
+    private void showStatusBarAfterSplash() {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                android.view.WindowInsetsController c = getWindow().getInsetsController();
+                if (c != null) {
+                    c.show(android.view.WindowInsets.Type.statusBars());
+                    c.setSystemBarsAppearance(
+                            android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS,
+                            android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS);
+                }
+            } else {
+                android.view.View d = getWindow().getDecorView();
+                d.setSystemUiVisibility(d.getSystemUiVisibility()
+                        & ~android.view.View.SYSTEM_UI_FLAG_FULLSCREEN);
+            }
+        } catch (Throwable ignore) { }
+    }
+
+    /**
+     * 顶部/左右安全区：让内容伸到全屏，但**文字不被摄像头、挖孔、刘海压住**。
+     *
+     * <h3>为什么第一版没生效（2026-10-17 用户截图）</h3>
+     * 第一版只读 `getDisplayCutout().getSafeInsetTop()`，但：
+     * <ol>
+     *   <li>本机是**居中挖孔**，很多 ROM 给的 cutout 安全区是 0，光靠它拿不到高度；</li>
+     *   <li>调用时机在 `applyWindowChrome()` 里，那时 insets 往往还没下发，
+     *       `getRootWindowInsets()` 直接返回 null，整段被 return 掉。</li>
+     * </ol>
+     * 于是全屏后 DSH 页面顶栏一路顶到屏幕最上沿，被摄像头压住。
+     *
+     * <h3>现在的取法</h3>
+     * 取 **状态栏高度** 与 **挖孔安全区** 的**较大值**作为上内边距：
+     * 居中挖孔的机器上状态栏高度就是那条摄像头带的高度，这样一定能让开。
+     * 左右取挖孔安全区（横屏时才有意义）。
+     *
+     * <p>`setClipToPadding(false)` 是必须的：只补 padding 不开这个，
+     * 滚动区域的子 View 会被裁在这块 padding 里面，DSH 的滚动列表顶部会被切掉一截。
+     */
+    private void applyCutoutInsets(android.view.View decor) {
+        try {
+            int top = 0, left = 0, right = 0;
+            // ① 状态栏高度（任何机型都有）
+            try {
+                int id = decor.getResources().getIdentifier("status_bar_height", "dimen", "android");
+                if (id > 0) top = decor.getResources().getDimensionPixelSize(id);
+            } catch (Throwable ignore) { }
+            // ② 挖孔/刘海安全区（有就取更大的那个）
+            if (android.os.Build.VERSION.SDK_INT >= 28) {
+                android.view.WindowInsets ins = decor.getRootWindowInsets();
+                if (ins != null && ins.getDisplayCutout() != null) {
+                    android.view.DisplayCutout dc = ins.getDisplayCutout();
+                    top = Math.max(top, dc.getSafeInsetTop());
+                    left = Math.max(left, dc.getSafeInsetLeft());
+                    right = Math.max(right, dc.getSafeInsetRight());
+                }
+            }
+            if (top <= 0 && left <= 0 && right <= 0) return;
+            /*
+             * ⚠️ 只补 contentRoot（工具条 + WebView 那一层），**绝不碰 decor 的子 View**。
+             *
+             * 第一版遍历 decor 的子 View 补 padding，而 splash 挂在更深一层
+             * （decor → windowRoot → splash），`c == splash` 判断永远不命中，
+             * 于是开屏也被往下推了 114px、顶部空出一条 —— 用户截图里那条深色带就是它。
+             * 现在直接落到内容容器上：开屏始终铺满整屏，内容整体下移让开摄像头。
+             */
+            if (contentRoot != null) {
+                /*
+                 * 原生侧**不给内容垫 padding**（不再算任何安全区）。
+                 *
+                 * 之前在这里垫 top 内边距，结果那一条是“原生底色”、下面是“网页底色”，
+                 * 两者永远差一点，看上去就是一道接缝（尤其深色下变白条）。
+                 * 现在：padding 归零，WebView 直接铺到屏幕最顶；
+                 * 让开状态栏的事交给网页自己（patch.js 给 body 加 padding-top）。
+                 */
+                insTop = 0;
+                applyContentPadding();
+                contentRoot.setClipToPadding(false);
+                contentRoot.setClipChildren(false);
+                if (LOG_SHELL) android.util.Log.i("DSH_SPLASH",
+                        "沉浸排版: 原生 padding=0，安全区交给网页 (statusBar=" + top + ")");
+            }
+        } catch (Throwable ignore) { }
+    }
+
     /** dsh web 打印出来的带 token 的 URL（解析到之后 WebView 直接加载它）。 */
     private volatile String dshUrl;
     /** proot 的库搜索目录与临时目录（prepareLibs 里设置）。 */
@@ -333,6 +614,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 跟随 DSH 主题：必须在建任何 View 之前设定，
+        // 否则会拿到上一个页面留下的颜色。
+        Ui.applyTheme(this);
+        Ui.applySystemBars(this);
 
         // 长任务（下载 rootfs / npm install）期间保持屏幕常亮。
         // 这是应用级窗口标志，不修改设备的任何系统设置。
@@ -355,6 +640,22 @@ public class MainActivity extends Activity {
 
         // ── UI：顶部状态条（含设置按钮）+（日志 / DSH WebView）叠层 ──
         LinearLayout root = new LinearLayout(this);
+        contentRoot = root;
+        /*
+         * 输入法避让（2026-10-18）。
+         *
+         * <h3>为什么原来不行</h3>
+         * manifest 里写的是 adjustResize，但本类又调了
+         * {@code setDecorFitsSystemWindows(false)} —— 两者互相抵消：
+         * 关掉之后系统不再自动缩窗口，而代码里没有任何人读
+         * IME 的 insets。于是键盘弹起时输入框原地不动、被盖住。
+         *
+         * <h3>为什么补在 contentRoot 上</h3>
+         * contentRoot 是「工具条 + WebView」那一层，补它的
+         * bottom padding 就等于把整块内容压短，WebView 重排后
+         * 输入框自然贴到键盘上沿。不碰 WebView 自身的布局。
+         */
+        decorPostInsets();
         root.setOrientation(LinearLayout.VERTICAL);
 
         LinearLayout bar = new LinearLayout(this);
@@ -468,6 +769,19 @@ public class MainActivity extends Activity {
         root.addView(bar, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         topBar = bar;
+        /*
+         * ⚠️ 顶部那条「DSH 运行中 · 127.0.0.1:3080 … 设置」**默认必须隐藏**（2026-10-17）。
+         *
+         * 用户截图报「顶部多出一条运行中栏」。它是本类自己建的 bar（statusBar +
+         * 设置按钮 + 重试按钮），原本只在启动期显示、就绪后由 hideTopBar() 收掉；
+         * 但只要有任何一条路径没走到 hideTopBar（比如这次改的"页面加载完才揭幕"），
+         * 它就永久留在屏幕最上方，把整个界面往下挤。
+         *
+         * 这里改成**建完就 GONE**：正常路径永远看不到它；
+         * 只有启动失败时 dismissSplash() 内部会把它重新亮出来，
+         * 保证「重试」按钮仍然点得到（这是原来那条失败恢复路径的硬要求）。
+         */
+        bar.setVisibility(android.view.View.GONE);
 
         FrameLayout stack = new FrameLayout(this);
         root.addView(stack, new LinearLayout.LayoutParams(
@@ -478,6 +792,16 @@ public class MainActivity extends Activity {
         output.setTextSize(13f);
         output.setPadding(40, 40, 40, 40);
         output.setTextIsSelectable(true);
+        /*
+         * ⚠️ 必须显式设色（2026-10-17）。
+         *
+         * 不设的话 TextView 的文字色来自系统主题（深色 → 白字），而跟随 DSH 切到浅色后
+         * 这块自检日志就变成**黑底 + 深字**，一个字都看不清（用户截图报过同一类问题，
+         * 输入框那次是同一个根因）。背景与文字都交给主题。
+         */
+        scroll.setBackgroundColor(Ui.BG);
+        output.setTextColor(Ui.TEXT);
+        output.setLineSpacing(Ui.dp(this, 3), 1f);
         scroll.addView(output);
         stack.addView(scroll, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -505,8 +829,16 @@ public class MainActivity extends Activity {
          * 开屏上那个"设置按钮"已按用户要求去掉，所以这里不再绑定它的动作。
          * 设置入口仍在右上角「设置」，以及 DSH 设置页里的「API Key（本机）」。
          */
-        stack.addView(splash, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        /*
+         * ⚠️ 开屏**不再挂在 stack 里**（2026-10-17，用户要求"做成真正的全屏"）。
+         *
+         * 原来它和日志/WebView 同属 stack，而 stack 在 root 里只占 bar 下面那一块，
+         * 于是开屏顶部永远露着一条状态栏/工具栏 —— 不是真全屏，交接时还会有个视觉断层。
+         *
+         * 现在挂到**窗口级**的 windowRoot（下面 setContentView 前的最后一步），
+         * 它盖住整块窗口，也就能顺手盖住 DSH 自己的"Loading plugins…"转圈 ——
+         * 动画收尾时直接露出已经画好的 DSH 页面，中间不留空窗。
+         */
         splashShownAt = SystemClock.uptimeMillis();
 
         /*
@@ -573,6 +905,27 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 mark("WebView 页面加载完成");
+                /*
+                 * ⚠️ 只有**真正的 DSH 页面**加载完才撤开屏快照。
+                 *
+                 * 踩过：为了预热渲染进程，onCreate 里先灌了一个空白 data: 页，
+                 * 它加载完同样会触发 onPageFinished —— 于是快照在 0.2 秒就被撤掉，
+                 * 用户 1.4 秒看到的还是"容器自检/检查中…"，秒显完全没起作用。
+                 * 预热页的 url 是 null/data:，用 isDshAppUrl 一眼就能区分。
+                 */
+                if (isDshAppUrl(url)) hideSnapshot();
+                /*
+                 * 页面真的画出来了 → 立刻揭幕（比"等收尾动画自己走完"更早，
+                 * 于是用户看到的是：动画收尾的同一瞬间，DSH 页面已经在后面了）。
+                 * 见 pageReveal 与 onServerReady 里的交棒策略。
+                 */
+                if (isDshAppUrl(url)) {
+                    final Runnable r = pageReveal;
+                    pageReveal = null;
+                    if (r != null) {
+                        try { r.run(); } catch (Throwable ignore) { }
+                    }
+                }
                 lastPageOkAt = System.currentTimeMillis();
                 /*
                  * 只往**本机 DSH 页面**注入适配补丁。
@@ -879,11 +1232,82 @@ public class MainActivity extends Activity {
             mark("启用 JS 语法降级（WebView Chrome/" + uaMajor + " < " + MIN_WEBVIEW_SYNTAX_MAJOR + "）");
         }
         // （setWebViewClient 已在上面设置，用于注入窄屏适配补丁）
+
+        /*
+         * 下载宿主。
+         *
+         * 为什么必须有：本工程从来没有 setDownloadListener / DownloadManager，
+         * 页面里任何 <a download> 或 blob 下载**都没有人接** ——
+         * 表现就是"点了提示正在下载，但其实什么也没发生"（Session 日志导出就是这条）。
+         *
+         * 分两类：
+         *   · blob: / data: —— 字节只活在页面内存里，宿主拿不到，
+         *     由 dsh-mobile.js 在点击阶段接管（读成 base64 → DshAndroid.saveFile）；
+         *     万一没接管成功，这里给一句明确提示，不静默失败。
+         *   · http(s): / content: —— 宿主能直接交给系统 DownloadManager。
+         */
+        webView.setDownloadListener((url, ua, disposition, mime, length) -> {
+            if (url == null) return;
+            if (url.startsWith("blob:") || url.startsWith("data:")) {
+                Log.w(TAG, "页面侧未接管的 blob/data 下载: " + url.substring(0, Math.min(48, url.length())));
+                android.widget.Toast.makeText(this,
+                        "这个下载需要页面侧配合，已尝试交给页面处理",
+                        android.widget.Toast.LENGTH_LONG).show();
+                return;
+            }
+            downloadByManager(url, ua, disposition, mime);
+        });
         webView.setVisibility(View.GONE);
         stack.addView(webView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        setContentView(root);
+        /*
+         * ── 开屏秒显（快照）已撤掉 ──
+         *
+         * 2026-10-17 用户明确："别把动画删了"，并且给了更好的方案 ——
+         * 把开屏动画做成**真全屏**、让它收尾时直接盖掉 DSH 自己的"Loading plugins…"转圈，
+         * 这样既保留了动画，又不会有"等 11 秒"的空窗期。
+         *
+         * 快照那套和动画是抢同一块屏幕的两种方案，同时留着只会互相打架
+         * （实测：快照要么被日志面板盖住，要么把动画藏掉），所以整段撤除。
+         * captureSnapshot()/hideSnapshot() 仍保留为普通方法，但不再被调用。
+         */
+
+        /*
+         * ── WebView 预热 ──
+         *
+         * 建好 WebView 只代表 Java 对象存在，**渲染进程还没起来**（要等第一次导航）。
+         * 而 DSH 的 URL 要 7.6 秒后才拿得到，等于白白让渲染进程干等。
+         *
+         * 这里先灌一个空白页，把渲染进程提前拉起来；等服务就绪、真正 loadUrl 时，
+         * 只差一次网络+解析，省掉渲染进程冷启动的那 0.5~1 秒。
+         *
+         * 必须用 loadDataWithBaseURL(null, ...) 而不是 loadUrl("about:blank")：
+         * about:blank 会占住一次导航，个别 ROM 上还会让后面的真实 URL 排队。
+         */
+        try {
+            webView.loadDataWithBaseURL(null,
+                    "<html><head><meta name=viewport content='width=device-width'>"
+                  + "</head><body style='margin:0;background:transparent'></body></html>",
+                    "text/html", "utf-8", null);
+        } catch (Throwable ignore) { }
+
+        /*
+         * ── 真·全屏开屏 ──
+         *
+         * 把整块界面（工具条 + stack）包进一个窗口级 FrameLayout，再在最上层盖开屏。
+         * 这样开屏覆盖的是**整个窗口**，包括原来露在外面的顶部工具栏区域；
+         * DSH 自己那层"Loading plugins…"也被它压在下面，收尾时直接露出画好的页面，
+         * 中间不出现空白帧。
+         */
+        FrameLayout windowRoot = new FrameLayout(this);
+        windowRoot.addView(root, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        if (splash != null) {
+            windowRoot.addView(splash, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        }
+        setContentView(windowRoot);
 
         /*
          * 【系统栏：为什么这里**不做**任何内边距处理（2026-10-05 实测后撤掉）】
@@ -1068,6 +1492,12 @@ public class MainActivity extends Activity {
 
     private volatile boolean heartbeatRunning = false;
     private int blankTicks = 0;
+    /** 连续多少次探测到"页面正常"（用来把白屏探测退避到 30 秒一次）。 */
+    private int probeOkTicks = 0;
+    /** 上一次白屏探测的时刻。 */
+    private long lastProbeAt = 0L;
+    /** 页面正常时，白屏探测的间隔（毫秒）。 */
+    private static final long PROBE_IDLE_MS = 30_000L;
     private long lastAutoReloadAt = 0L;
     private boolean containerDownNotified = false;
     /** 最近一次页面加载完成的时刻（用来判断"刚加载就崩"还是"稳定跑了一阵"）。 */
@@ -1130,7 +1560,18 @@ public class MainActivity extends Activity {
             onServerReady(cur);
             return;
         }
-        probeBlank();
+        /*
+         * 白屏探测**按情况退避**（2026-10-21 发热优化）：
+         * 页面一直好好的时候没必要每 5 秒摸一次 —— 连续 3 次正常之后改成 30 秒一次，
+         * 一旦发现异常立刻回到 5 秒。地址比对（上面的 cur.equals）仍然每 5 秒做，
+         * 那只是读一个静态字段，几乎不花钱。
+         */
+        long nowMs = System.currentTimeMillis();
+        long gap = probeOkTicks >= 3 ? PROBE_IDLE_MS : RECONNECT_TICK_MS;
+        if (nowMs - lastProbeAt >= gap) {
+            lastProbeAt = nowMs;
+            probeBlank();
+        }
     }
 
     /**
@@ -1154,10 +1595,109 @@ public class MainActivity extends Activity {
         super.onConfigurationChanged(newConfig);
         appendReport("  · 屏幕配置变化（orientation=" + newConfig.orientation
                 + "，宽度 " + newConfig.screenWidthDp + "dp）—— 不重建界面，只通知页面重排\n");
+        /*
+         * 系统切深色/浅色时重刷开屏配色（2026-10-17）。
+         *
+         * 之前 applyWindowChrome() 只在 onCreate 里调一次，
+         * 所以开屏颜色一直卡在启动那一刻的系统主题上，
+         * 用户说“开屏动画不跟随系统”就是这个原因。
+         */
+        applyWindowChrome();
         // 等一帧让 WebView 拿到新宽度，再通知页面；重试一次兜住"这一帧还没量好"
         if (webView == null) return;
         webView.postDelayed(() -> reflowPage(), 120);
         webView.postDelayed(() -> reflowPage(), 500);
+    }
+
+    /**
+     * <b>singleTask 复用时的入口</b>（GitHub issue #3 的修复配套）。
+     *
+     * <p>manifest 已把本 Activity 改成 `singleTask`，所以点通知栏「正在运行」、
+     * 点桌面图标、或从最近任务回来时**不会再新建实例**，而是走这里把已有实例提前。
+     *
+     * <p>这里**刻意什么都不重建** —— 修这个 bug 的核心就是"人回来了，WebView 和当前会话
+     * 原样保留"。原来每次启动都新开一个实例，新实例的 WebView 从头加载，界面上就是一个
+     * 没有会话的空白页，用户以为记录被清空了。
+     *
+     * <p>唯一做的事：万一 WebView 其实还没成功加载过（停在遮罩/白屏上），趁这次回来重试一下。
+     */
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        try {
+            String url = DshService.getUrl();
+            if (webView != null && url != null && !url.isEmpty() && webView.getUrl() == null) {
+                webView.loadUrl(url);
+            }
+        } catch (Throwable ignore) { }
+    }
+
+    // ─────────────────── 开屏快照（秒显） ───────────────────
+
+    /** 快照文件：App 私有缓存，随卸载清掉，不会污染用户存储。 */
+    private java.io.File snapshotFile() {
+        return new java.io.File(getCacheDir(), "last-screen.png");
+    }
+
+    /**
+     * 把当前 WebView 的画面存成 PNG（在 onPause 里调）。
+     *
+     * <p>几个必须注意的点：
+     * <ul>
+     *   <li>**必须在 WebView 有内容时截**（getWidth()>0 且已加载过页面），否则存出来是空白；</li>
+     *   <li>先按 0.5 倍缩小再存 —— 原尺寸 1080×2376 存 PNG 有两三 MB，
+     *       缩一半只剩几百 KB，反正它只是"让人觉得秒开的底图"，糊一点无所谓；</li>
+     *   <li>整个方法吞异常：截快照失败绝不能影响退出流程。</li>
+     * </ul>
+     */
+    private void captureSnapshot() {
+        try {
+            if (webView == null) return;
+            if (webView.getWidth() <= 0 || webView.getHeight() <= 0) return;
+            if (webView.getVisibility() != View.VISIBLE) return;
+            String u = webView.getUrl();
+            if (u == null || !isDshAppUrl(u)) return;
+
+            android.graphics.Bitmap full = android.graphics.Bitmap.createBitmap(
+                    webView.getWidth(), webView.getHeight(),
+                    android.graphics.Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas c = new android.graphics.Canvas(full);
+            webView.draw(c);
+
+            int w = Math.max(1, full.getWidth() / 2);
+            int h = Math.max(1, full.getHeight() / 2);
+            android.graphics.Bitmap small = android.graphics.Bitmap.createScaledBitmap(
+                    full, w, h, true);
+            java.io.File f = snapshotFile();
+            java.io.FileOutputStream fo = new java.io.FileOutputStream(f);
+            small.compress(android.graphics.Bitmap.CompressFormat.PNG, 90, fo);
+            fo.close();
+            if (small != full) full.recycle();
+            Log.i(TAG, "开屏快照已保存: " + w + "x" + h + " · " + (f.length() / 1024) + "KB");
+        } catch (Throwable t) {
+            Log.w(TAG, "开屏快照保存失败（忽略）", t);
+        }
+    }
+
+    /** 页面真的画出来了 → 让快照淡出。 */
+    private void hideSnapshot() {
+        final android.widget.ImageView v = snapshotView;
+        if (v == null) return;
+        snapshotView = null;
+        try {
+            v.animate().alpha(0f).setDuration(180).withEndAction(() -> {
+                try {
+                    ViewGroup p = (ViewGroup) v.getParent();
+                    if (p != null) p.removeView(v);
+                } catch (Throwable ignore) { }
+            }).start();
+        } catch (Throwable t) {
+            try {
+                ViewGroup p = (ViewGroup) v.getParent();
+                if (p != null) p.removeView(v);
+            } catch (Throwable ignore) { }
+        }
     }
 
     /**
@@ -1175,12 +1715,23 @@ public class MainActivity extends Activity {
     }
 
     /** 量一下页面正文有多长；连续几次都是空的就认为白屏了。 */
+    /**
+     * 量一下页面正文有多长（判"白屏"）。
+     *
+     * <h3>⚠️ 必须用 textContent，不能用 innerText（2026-10-21 发热的元凶之一）</h3>
+     * {@code innerText} 会**强制样式重算 + 整页布局**才能算出"看得见的文字"，
+     * 而这个函数以前是**每 5 秒**跑一次 —— 长会话（几百条消息 + 图片 + 工具卡片）
+     * 每次都要重排一遍整页。屏幕亮着、聊着天的时候，这一项就足够让机器持续发热。
+     *
+     * <p>{@code textContent} 只读文本节点的长度，**不触发任何布局**。
+     * 判白屏只需要"是不是几乎没字"，两者在这一点上完全等价。
+     */
     private void probeBlank() {
         if (webView == null || webView.getVisibility() != View.VISIBLE) return;
         webView.evaluateJavascript(
                 "(function(){try{var b=document.body;"
               + "if(!b)return 0;"
-              + "return ((b.innerText||'').trim().length);}catch(e){return -1;}})()",
+              + "return (b.textContent||'').length;}catch(e){return -1;}})()",
                 value -> {
                     int len;
                     try {
@@ -1190,7 +1741,12 @@ public class MainActivity extends Activity {
                         return;                     // 解析不出来就当没测到，别乱重载
                     }
                     if (len < 0) return;            // JS 里抛异常了（页面正在换），忽略
-                    if (len > 20) { blankTicks = 0; return; }
+                    if (len > 20) {
+                        blankTicks = 0;
+                        probeOkTicks++;
+                        return;
+                    }
+                    probeOkTicks = 0;
                     blankTicks++;
                     Log.i(TAG, "心跳：页面正文长度 " + len + "（连续第 " + blankTicks + " 次）");
                     if (blankTicks >= BLANK_TICKS_TO_RELOAD) {
@@ -3276,36 +3832,87 @@ public class MainActivity extends Activity {
              * 现在把"交棒"推迟到收尾播完之后，收尾才是真的看得见。
              */
             final TdshSplashView v = splash;
+            /*
+             * ── 交棒策略（2026-10-17 改，用户要求"动画结尾盖住 DSH 自己转圈那段"）──
+             *
+             * 原顺序：收尾播完 → 才 loadUrl → 页面可见。于是收尾一结束就露出一张空白页，
+             * DSH 自己还要再转约 3.6 秒（实测 7.6s 服务就绪 → 11.2s 页面才画出来），
+             * 那 3.6 秒正是用户感觉"拖慢"的地方。
+             *
+             * 现在拆成两半：**立刻在后台加载（开屏仍盖着）**，等 onPageFinished 再揭幕。
+             * DSH 的转圈全程在开屏底下跑完，用户看到的是一个连续动画 → 无缝。
+             */
+            final Runnable loadNow = () -> {
+                try {
+                    webView.loadUrl(url);
+                    appendReport("  WebView 开始加载（开屏仍遮着）: " + url + "\n");
+                } catch (Throwable t) {
+                    Log.w(TAG, "loadUrl 失败", t);
+                }
+            };
             final Runnable handOver = () -> {
-                webView.setVisibility(View.VISIBLE);
-                webView.loadUrl(url);
-                appendReport("  WebView 加载: " + url + "\n");
+                try {
+                    webView.setVisibility(View.VISIBLE);
+                } catch (Throwable ignore) { }
+                dismissSplash();
             };
 
             if (v == null) {
-                handOver.run();
+                loadNow.run();
                 restoreWindowChrome();
                 hideTopBar();
+                handOver.run();
                 return;
             }
 
             v.setProgress(1f);                    // 读数补满：已就绪 / 100.0%
-            final boolean[] done = {false};
-            final Runnable finish = () -> {
+            /*
+             * ⚠️ 必须**两边都满足**才揭幕（2026-10-17 第二次修）。
+             *
+             * 上一次我让 onPageFinished 一到就揭幕 —— 结果页面约 11.2 秒就加载完，
+             * 而收尾动画要 1.7 秒，于是收尾播到一半就被切掉
+             * （用户原话："动画结尾没播完，要不就加快结尾播放速度试试"）。
+             *
+             * 现在拆成两个条件：
+             *   pageOk     —— 页面真的画好了（onPageFinished）
+             *   endingDone —— 收尾动画播完了（collapse 回调）
+             * 任一条件变化都调一次 tryReveal，**两个都满足**才真的揭开。
+             * 于是"转圈藏在开屏底下"和"收尾完整播完"两个目标同时成立。
+             */
+            final boolean[] pageOk = {false}, endingDone = {false}, done = {false};
+            final Runnable[] tryReveal = new Runnable[1];
+            tryReveal[0] = () -> {
                 if (done[0]) return;
+                if (!pageOk[0] || !endingDone[0]) return;
                 done[0] = true;
-                // 顺序要紧：先让页面可见，再收开屏。
-                // dismissSplash() 会按"webView 是否可见"决定要不要把顶部状态栏亮出来；
-                // 若反过来，它会以为"不是正常就绪"而把那条栏亮回来，闪一下。
+                pageReveal = null;
                 handOver.run();
-                dismissSplash();
+            };
+            // onPageFinished 只负责把 pageOk 置真，揭不揭由 tryReveal 决定
+            pageReveal = () -> {
+                pageOk[0] = true;
+                tryReveal[0].run();
             };
 
-            // 让"已就绪"先停一下，再开始倒放
+            // ① 立刻开始后台加载（开屏还盖着，用户看不到 DSH 的转圈）
+            loadNow.run();
+
+            // ② 让"已就绪"先停一下，再开始倒放
             final long shown = SystemClock.uptimeMillis() - splashShownAt;
             final long wait = Math.max(READY_HOLD_MS, SPLASH_MIN_MS - shown);
-            v.postDelayed(() -> v.collapse(finish), wait);
-            v.postDelayed(finish, wait + 2600);   // 兜底：收尾回调没来也强制交棒
+            final Runnable endFinish = () -> {
+                endingDone[0] = true;
+                tryReveal[0].run();
+            };
+            v.postDelayed(() -> v.collapse(endFinish), wait);
+            // 兜底 1：收尾回调万一没来，也当它播完了
+            v.postDelayed(endFinish, wait + 1800);
+            // 兜底 2：页面迟迟不加载完（白屏/失败），绝不把开屏卡成永久封面
+            v.postDelayed(() -> {
+                pageOk[0] = true;
+                endingDone[0] = true;
+                tryReveal[0].run();
+            }, wait + PAGE_REVEAL_MAX_MS);
 
             restoreWindowChrome();   // 开屏收起，系统栏交还系统
             hideTopBar();
@@ -3992,7 +4599,142 @@ public class MainActivity extends Activity {
                 & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
     }
 
-    private class AppBridge {        @android.webkit.JavascriptInterface
+    /**
+     * 用系统 DownloadManager 下载 http(s) / content: 链接，落到公共下载目录的 Tdsh/ 子目录。
+     *
+     * <p>只处理宿主能自己拿到字节的那类链接；blob/data 交给页面侧（见 setDownloadListener）。
+     */
+    private void downloadByManager(String url, String ua, String disposition, String mime) {
+        try {
+            android.app.DownloadManager.Request req =
+                    new android.app.DownloadManager.Request(android.net.Uri.parse(url));
+            if (ua != null) req.addRequestHeader("User-Agent", ua);
+            if (mime != null) req.setMimeType(mime);
+            String name = android.webkit.URLUtil.guessFileName(url, disposition, mime);
+            if (name == null || name.trim().isEmpty()) name = "dsh-download";
+            req.setDestinationInExternalPublicDir(
+                    android.os.Environment.DIRECTORY_DOWNLOADS, "Tdsh/" + name);
+            req.setNotificationVisibility(
+                    android.app.DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            android.app.DownloadManager dm =
+                    (android.app.DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+            if (dm == null) {
+                android.widget.Toast.makeText(this, "系统下载服务不可用",
+                        android.widget.Toast.LENGTH_LONG).show();
+                return;
+            }
+            dm.enqueue(req);
+            android.widget.Toast.makeText(this, "已开始下载，完成后通知栏提示",
+                    android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Throwable t) {
+            Log.e(TAG, "下载失败: " + url, t);
+            android.widget.Toast.makeText(this, "下载失败：" + t,
+                    android.widget.Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private class AppBridge {
+
+        /**
+         * 手机上的工作区文件夹名 —— 给网页把「root」改回真名用。
+         *
+         * <p>为什么需要这个：容器里那个工作区路径是 `/root`，而它其实是把手机的
+         * {@link Env#WORKSPACE}（=`/sdcard/dsh`）挂进去的。DSH 只是照实显示**容器路径的
+         * 末段**，所以界面上写的是 "root"。用户看到的是"我的工作区明明叫 dsh，
+         * 为什么显示 root"。DOM 里拿不到真实路径（只有工作区 UUID），所以由原生把
+         * 手机侧的真名直接告诉网页，见 patch.js 的 patchWorkspaceNames()。
+         */
+        /**
+         * 状态栏高度（px）—— 给网页里的浮动鲸鱼按钮定位用。
+         *
+         * <p>为什么要给：edge-to-edge 之后网页内容画到状态栏底下，而
+         * #dsh-rail-btn 的 CSS 写死 	op:8px，结果鲸鱼被顶进状态栏、
+         * 压在时钟上（2026-10-17 用户截图）。CSS 里拿不到系统栏高度，只能由原生给。
+         */
+        /** 当前是不是浅色主题（给网页里的浮动鲸鱼按钮选底色用）。 */
+        @android.webkit.JavascriptInterface
+        public boolean isLightTheme() {
+            return Ui.dshIsLight(MainActivity.this);
+        }
+
+        @android.webkit.JavascriptInterface
+        public int statusBarHeight() {
+            try {
+                int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+                return id > 0 ? getResources().getDimensionPixelSize(id) : 0;
+            } catch (Throwable t) { return 0; }
+        }
+
+        /**
+         * 网页上报「现在有没有在生成 / 有没有工具在跑」（1 = 在跑，0 = 闲）。
+         *
+         * <h3>为什么要有这一路（2026-10-21 用户报的 bug）</h3>
+         * 悬浮球原来的阶段只吃两样东西：dsh 进程的 stdout（其实只有启动日志）和
+         * 容器 CPU 采样（等模型吐字时可能测不出增量）。于是球**永远显示「空闲」**，
+         * 表情也永远不换。
+         *
+         * <p>而网页是**第一现场**：它在渲染"深度求索中"、在往消息里追加字、
+         * 在弹工具执行卡片。所以由 patch.js 的 pageStageWatch 用 MutationObserver
+         * 盯着 DOM 的动静，每秒推一次过来 —— 这条信号最准，也最不受机型影响。
+         *
+         * <p>安全上没风险：只写两个静态字段，不回传任何页面内容。
+         */
+        @android.webkit.JavascriptInterface
+        public void pageBusy(int busy) {
+            try {
+                DshService.setPageBusy(busy == 1);
+            } catch (Throwable ignore) { }
+        }
+
+        /** 网页上报阶段（0=空闲 1=准备 2=思考 3=编译 4=干活 5=完成 6=出错，见 BallStage）。 */
+        @android.webkit.JavascriptInterface
+        public void pageStage(int stage) {
+            try {
+                DshService.setPageStage(stage);
+            } catch (Throwable ignore) { }
+        }
+
+        @android.webkit.JavascriptInterface
+        public String workspaceName() {
+            try {
+                java.io.File f = new java.io.File(Env.WORKSPACE);
+                String n = f.getName();
+                return (n == null || n.isEmpty()) ? "工作区" : n;
+            } catch (Throwable t) {
+                return "工作区";
+            }
+        }
+
+        /**
+         * WebUI 上报 DSH 当前主题（用户要求"跟随 DSH"而不是跟随系统）。
+         *
+         * <p>见 patch.js 的 reportTheme()：它读 DSH 页面**实际渲染出来的底色亮度**判断，
+         * 主题一变就调一次这里。原生页在 onCreate 里读 {@link Ui#dshIsLight}，
+         * 于是 DSH 一切浅色，手机权限 / 插件市场 / 悬浮球设置这些页也跟着变浅。
+         *
+         * @param v "light"/"dark"/"true"/"false" 都认
+         */
+        @android.webkit.JavascriptInterface
+        public void setTheme(String v) {
+            try {
+                String s = v == null ? "" : v.trim().toLowerCase();
+                final boolean light = s.equals("light") || s.equals("true") || s.equals("1");
+                Ui.setDshLight(MainActivity.this, light);
+                /*
+                 * ⚠️ 这里**只存不重建**。
+                 *
+                 * 第一版写成"主题变了就 finish + startActivity 重建自己"，结果启动图
+                 * （深色）和主页（浅色）被 reportTheme 交替探测到 → 主题反复判定为"变了"
+                 * → Activity 无限重建，界面直接**白屏**（实测踩到）。
+                 *
+                 * 而且重建本来就多余：原生页（手机权限 / 插件市场 / 悬浮球设置…）
+                 * 都在 onCreate 里读 Ui.dshIsLight，下次打开自然就是新主题。
+                 * 已打开着的页面保持旧配色无妨 —— 比整页闪一下、甚至卡死好得多。
+                 */
+            } catch (Throwable ignore) { }
+        }
+
+        @android.webkit.JavascriptInterface
         public void openAppSettings() {
             runOnUiThread(MainActivity.this::showSettingsDialog);
         }
@@ -4250,6 +4992,94 @@ public class MainActivity extends Activity {
             }
             return sb.append('"').toString();
         }
+
+        /**
+         * 把页面生成的字节落盘。
+         *
+         * <p>为什么需要它：WebView 里的 {@code <a download>} 与 {@code blob:} 下载
+         * **没有宿主** —— 本工程从来没有 {@code setDownloadListener} / {@code DownloadManager}，
+         * 所以点「下载 Session 日志」只会提示"正在下载"，然后什么都不会发生。
+         * blob 的字节只活在页面内存里、宿主拿不到，只能由页面读成 base64 交过来。
+         *
+         * @param name   建议文件名（会做安全化）
+         * @param base64 文件内容的 base64
+         * @return 成功返回落盘的绝对路径；失败返回以 {@code ERROR} 开头的说明
+         */
+        @android.webkit.JavascriptInterface
+        public String saveFile(String name, String base64) {
+            try {
+                if (base64 == null || base64.isEmpty()) return "ERROR 内容为空";
+                // 32MB 上限：base64 要整段进内存，再大就该走「用别的应用打开」而不是下载
+                long approx = (long) base64.length() * 3L / 4L;
+                if (approx > 32L * 1024 * 1024) {
+                    return "ERROR 文件过大（约 " + (approx / 1048576) + " MB），请改用「用别的应用打开」";
+                }
+                byte[] data = android.util.Base64.decode(base64, android.util.Base64.DEFAULT);
+
+                java.io.File dir = new java.io.File(
+                        android.os.Environment.getExternalStorageDirectory(), "Download/Tdsh");
+                if (!dir.exists() && !dir.mkdirs()) return "ERROR 建目录失败: " + dir;
+                java.io.File f = uniqueFile(dir, safeFileName(name));
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(f)) {
+                    out.write(data);
+                }
+                final String abs = f.getAbsolutePath();
+                runOnUiThread(() -> android.widget.Toast.makeText(MainActivity.this,
+                        "已保存到 " + abs, android.widget.Toast.LENGTH_LONG).show());
+                return abs;
+            } catch (Throwable t) {
+                Log.e(TAG, "saveFile 失败", t);
+                return "ERROR " + t;
+            }
+        }
+
+        /**
+         * 写系统剪贴板。
+         *
+         * <p>为什么需要它：WebView 里 {@code navigator.clipboard.writeText} 经常不可用
+         * （非安全上下文 / 权限被拒），而 DSH 的**文件复制**那条路径没有 {@code execCommand}
+         * 退路，于是"文档里的字复制不出来"。页面侧在 clipboard API 失败时落到这里。
+         *
+         * @return "OK" 或 "ERROR …"
+         */
+        @android.webkit.JavascriptInterface
+        public String copyText(String text) {
+            try {
+                android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                        getSystemService(CLIPBOARD_SERVICE);
+                if (cm == null) return "ERROR 剪贴板不可用";
+                cm.setPrimaryClip(android.content.ClipData.newPlainText(
+                        "dsh", text == null ? "" : text));
+                return "OK";
+            } catch (Throwable t) {
+                Log.w(TAG, "copyText 失败", t);
+                return "ERROR " + t;
+            }
+        }
+
+        /** 文件名安全化：挡掉路径分隔符与控制字符，超长则保留扩展名截断。 */
+        private String safeFileName(String name) {
+            if (name == null || name.trim().isEmpty()) return "dsh-export";
+            name = name.replaceAll("[\\\\/:*?\"<>|\\r\\n\\t]", "_").trim();
+            if (name.length() > 120) {
+                int dot = name.lastIndexOf('.');
+                String ext = (dot > 0 && name.length() - dot <= 12) ? name.substring(dot) : "";
+                name = name.substring(0, Math.max(1, 120 - ext.length())) + ext;
+            }
+            return name.isEmpty() ? "dsh-export" : name;
+        }
+
+        /** 同名不覆盖：自动追加 (1)(2)… */
+        private java.io.File uniqueFile(java.io.File dir, String safe) {
+            java.io.File f = new java.io.File(dir, safe);
+            if (!f.exists()) return f;
+            String base = safe, ext = "";
+            int dot = safe.lastIndexOf('.');
+            if (dot > 0) { base = safe.substring(0, dot); ext = safe.substring(dot); }
+            int n = 1;
+            while (f.exists() && n < 10000) f = new java.io.File(dir, base + "(" + (n++) + ")" + ext);
+            return f;
+        }
     }
 
     // ── Phase 2：设置页与前台服务 ──────────────────────────────
@@ -4305,6 +5135,7 @@ public class MainActivity extends Activity {
         delBtn.setOnClickListener(v -> confirmWipeSessions());
 
         final EditText input = new EditText(this);
+        Ui.styleInput(input);   // 底色/文字/提示色随主题
         input.setHint("sk-...");
         input.setTextSize(14f);
         input.setText(DshService.getApiKey(this));
@@ -4601,6 +5432,11 @@ public class MainActivity extends Activity {
         // 退回后台（以及弹出文件选择器/相册）时停掉心跳：既省电，
         // 也避免"用户正在选文件时页面被自动重载"。
         stopHeartbeat();
+        /*
+         * 注意：这里**不再**存开屏快照（2026-10-17）。
+         * 用户改主意了 —— 保留开屏动画、把它做成真全屏去盖住 DSH 的加载转圈，
+         * 比"贴一张上次的静态图"更好。快照那套已整段撤除。
+         */
     }
 
     @Override

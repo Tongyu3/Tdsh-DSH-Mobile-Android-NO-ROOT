@@ -2,6 +2,7 @@ package com.dshmobile.probe;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Intent;
 import android.os.Bundle;
 import android.view.ViewGroup;
 import android.widget.Button;
@@ -39,6 +40,10 @@ public class UpgradeActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 跟随 DSH 主题：必须在建任何 View 之前设定，
+        // 否则会拿到上一个页面留下的颜色。
+        Ui.applyTheme(this);
+        Ui.applySystemBars(this);
 
         ScrollView scroll = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
@@ -102,8 +107,85 @@ public class UpgradeActivity extends Activity {
         log.setPadding(0, pad / 2, 0, 0);
         root.addView(log);
 
+        root.addView(buildAppUpdateCard());
+
         setContentView(scroll);
         check(true);
+    }
+
+    /**
+     * 「App 自身更新」卡片（用户要求："热更新，新版本推送"）。
+     *
+     * <p>**先把边界讲清楚**（写在界面上）：安卓不允许普通应用静默替换自己，
+     * 最后一按"安装"必须由系统安装器接管。所以这里能做到的是
+     * 「自动发现新版本 + 通知栏推送 + 一键打开下载」，不是无声自更新。
+     * 真正意义上的"热更新"是容器里那份 DSH 内核 —— 上面那张卡就是干那个的。
+     */
+    private LinearLayout buildAppUpdateCard() {
+        final TextView state = new TextView(this);
+        state.setTextSize(13f);
+        state.setPadding(0, 8, 0, 8);
+        state.setText(AppUpdate.statusText(this));
+
+        LinearLayout card = Ui.card(this, "App 自身更新",
+                "当前 Tdsh 版本与最新 Release 的对比。\n"
+                + "· 发现新版本会在通知栏提醒一次（同一个版本只提醒一次）；\n"
+                + "· 点「下载新版」会打开浏览器下载 APK，装的时候由系统的安装器接管 ——\n"
+                + "  **安卓不允许应用自己静默替换自己**，最后那一下必须你点；\n"
+                + "· 真正的「热更新」是上面那张卡的 DSH 内核（容器里 npm 换版本，不用重装 App）。");
+        card.addView(state);
+
+        final TextView notes = new TextView(this);
+        notes.setTextSize(12f);
+        notes.setTextColor(Ui.SUB);
+        notes.setPadding(0, 8, 0, 0);
+        card.addView(notes);
+
+        card.addView(Ui.button(this, "检查 App 更新", true, v -> {
+            state.setText("正在查 GitHub Releases…");
+            notes.setText("");
+            new Thread(() -> {
+                final AppUpdate.Info info = AppUpdate.fetchLatest(this, true);
+                final String cur = AppUpdate.currentVersion(this);
+                runOnUiThread(() -> {
+                    if (info == null) {
+                        state.setText("查不到（没网 / GitHub 不通）—— 当前 v" + cur);
+                        return;
+                    }
+                    boolean newer = AppUpdate.compare(info.version, cur) > 0;
+                    state.setText(newer
+                            ? ("有新版 " + info.tag + "（当前 v" + cur + "）")
+                            : ("已经是最新（当前 v" + cur + "）"));
+                    if (newer) {
+                        notes.setText(info.notes == null || info.notes.isEmpty()
+                                ? "" : stripMd(info.notes));
+                    }
+                });
+            }, "app-update-check").start();
+        }));
+
+        card.addView(Ui.button(this, "打开下载页（Releases）", false, v ->
+                openUrl("https://github.com/Tongyu3/DSH-Mobile-Android-NO-ROOT/releases")));
+        return card;
+    }
+
+    /** 发行说明是 Markdown，这里只做个粗剪，够看就行（别在界面上堆解释性长文）。 */
+    private static String stripMd(String s) {
+        String t = s.replaceAll("(?m)^#{1,6}\\s*", "· ")
+                    .replaceAll("\\*\\*(.+?)\\*\\*", "$1")
+                    .replaceAll("`([^`]+)`", "$1")
+                    .replaceAll("\\[(.+?)\\]\\([^)]*\\)", "$1");
+        return t.length() > 900 ? t.substring(0, 900) + "…" : t;
+    }
+
+    /** 交给系统浏览器打开（App 不自己下 APK，避免"下载了但装不上"的困惑）。 */
+    private void openUrl(String url) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        } catch (Throwable t) {
+            Toast.makeText(this, "打不开浏览器：" + t, Toast.LENGTH_LONG).show();
+        }
     }
 
     private String chosenTag() {

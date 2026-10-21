@@ -311,13 +311,30 @@ public final class PhoneBridge {
     /** 插件市场里的一条搜索结果。 */
     public static final class PluginHit {
         public final String name, version, description, date;
-        PluginHit(String n, String v, String d, String dt) {
+        /**
+         * npm 的 {@code keywords} —— **市场分类就靠它**。
+         *
+         * <p>为什么是它：npm 没有 {@code category}/{@code tags} 这类专门字段，
+         * 而每个 dsh 插件按约定都会打 {@code dsh-plugin} 标签，创作者通常还会
+         * 补上能力词（memory / theme / preset / ui …）。分类只能从这些词推。
+         */
+        public final java.util.List<String> keywords;
+
+        PluginHit(String n, String v, String d, String dt, java.util.List<String> kw) {
             name = n; version = v; description = d; date = dt;
+            keywords = kw == null ? java.util.Collections.<String>emptyList() : kw;
         }
     }
 
+    /** 一页搜索结果：带上 npm 的 total，界面才能写"共 N 个"而不是只写"这 40 个"。 */
+    public static final class MarketPage {
+        public final java.util.List<PluginHit> hits;
+        public final int total;
+        MarketPage(java.util.List<PluginHit> h, int t) { hits = h; total = t; }
+    }
+
     /**
-     * 在 npm 上搜 dsh 插件。
+     * 在 npm 上搜 dsh 插件（旧签名，不带分页）。
      *
      * <p>官方发现机制就是 npm 上的 {@code dsh-plugin} 标签 —— 直接问 registry 最准，
      * 不需要我们自己维护一份清单。
@@ -334,6 +351,19 @@ public final class PhoneBridge {
      * 而镜像对"按名字装包"是完全可靠的。
      */
     public static java.util.List<PluginHit> marketSearch(Context ctx, String q) throws Exception {
+        return marketSearch(ctx, q, 0, 25).hits;
+    }
+
+    /**
+     * 带分页的搜索。
+     *
+     * <p>为什么要加 from/size：npm 上带 {@code dsh-plugin} 标签的包实测有 8000+ 条，
+     * 而旧代码把 {@code size=25} 写死、也没有 {@code from} —— 界面**永远只显示 25 条**，
+     * 状态行还写着"找到 25 个插件"，看起来像市场里就只有这么点东西。
+     */
+    public static MarketPage marketSearch(Context ctx, String q, int from, int size) throws Exception {
+        if (size <= 0 || size > 100) size = 40;
+        if (from < 0) from = 0;
         String text = (q == null || q.trim().isEmpty())
                 ? "keywords:dsh-plugin"
                 : q.trim() + " keywords:dsh-plugin";
@@ -347,7 +377,8 @@ public final class PhoneBridge {
         for (String base : sources) {
             try {
                 java.net.HttpURLConnection c = (java.net.HttpURLConnection)
-                        new java.net.URL(base + "/-/v1/search?size=25&text=" + encoded)
+                        new java.net.URL(base + "/-/v1/search?size=" + size + "&from=" + from
+                                + "&text=" + encoded)
                                 .openConnection();
                 c.setConnectTimeout(10000);
                 c.setReadTimeout(15000);
@@ -360,23 +391,30 @@ public final class PhoneBridge {
                 }
                 org.json.JSONObject o = new org.json.JSONObject(sb.toString());
                 org.json.JSONArray arr = o.optJSONArray("objects");
+                int total = o.optInt("total", 0);
                 java.util.List<PluginHit> out = new java.util.ArrayList<>();
                 for (int i = 0; arr != null && i < arr.length(); i++) {
                     org.json.JSONObject pk = arr.getJSONObject(i).optJSONObject("package");
                     if (pk == null) continue;
                     String desc = pk.optString("description", "").replace('\n', ' ').trim();
+                    org.json.JSONArray kw = pk.optJSONArray("keywords");
+                    java.util.List<String> kws = new java.util.ArrayList<>();
+                    for (int k = 0; kw != null && k < kw.length(); k++) {
+                        String s = kw.optString(k, "").trim();
+                        if (!s.isEmpty()) kws.add(s);
+                    }
                     out.add(new PluginHit(pk.optString("name"), pk.optString("version"), desc,
-                            pk.optString("date", "")));
+                            pk.optString("date", ""), kws));
                 }
                 // 搜到东西才认；空结果继续试下一个源（空的往往意味着"这个源不会搜"）
-                if (!out.isEmpty()) return out;
+                if (!out.isEmpty()) return new MarketPage(out, total > 0 ? total : out.size());
             } catch (Throwable t) {
                 last = t;
                 Log.w(TAG, "插件搜索失败（源 " + base + "）", t);
             }
         }
         if (last != null) throw new Exception("搜索失败：" + last.getMessage());
-        return new java.util.ArrayList<>();
+        return new MarketPage(new java.util.ArrayList<PluginHit>(), 0);
     }
 
     /** profile 里已装的 bundle 列表。 */
@@ -545,20 +583,204 @@ public final class PhoneBridge {
             // 缩到 720 宽：够模型看清文字，又能显著省 token 和上传时间
             android.graphics.Bitmap small = Screenshot.downscale(s.bitmap, 720);
             java.io.File f = Screenshot.save(small, "shot.png");
-            // 再留一份原图，方便需要看清细节时回看
-            java.io.File full = Screenshot.save(s.bitmap, "shot-full.png");
-            String out = "OK 已截图\n"
-                    + "  文件: " + f.getAbsolutePath() + "\n"
-                    + "  原图: " + full.getAbsolutePath() + "\n"
-                    + "  方式: " + s.backend + "\n"
-                    + "  前台: " + fg + "\n"
-                    + "  尺寸: " + s.bitmap.getWidth() + "x" + s.bitmap.getHeight()
-                    + "（缩略图 " + small.getWidth() + "x" + small.getHeight() + "）\n";
             if (small != s.bitmap) small.recycle();
-            s.bitmap.recycle();
-            return out;
+
+            /*
+             * 【为什么原图改成"按需"生成（2026-10-05，采纳群友实测建议）】
+             *
+             * 原来每次 /shot 都额外写一份 1080×2400 的全尺寸 PNG（约 583KB、约 39ms）。
+             * 单次无所谓，但"连续看屏幕"这类用法（2fps）就是
+             * **~70MB/分钟的闪存写入** —— 省的是闪存寿命和电，不是延迟。
+             * 而那份原图绝大多数调用者根本用不到（缩略图已经够模型看清文字）。
+             *
+             * 现在：只有显式 `/shot?full=1` 才写原图，而且**丢到后台线程**写 ——
+             * ⚠️ `recycle()` 必须跟着挪进后台线程：留在主流程先回收，
+             * 后台还在读 `s.bitmap` 就会崩（这条是建议里点名的坑）。
+             */
+            boolean wantFull = "1".equals(p.get("full")) || "true".equalsIgnoreCase(p.get("full"));
+            StringBuilder out = new StringBuilder("OK 已截图\n")
+                    .append("  文件: ").append(f.getAbsolutePath()).append('\n')
+                    .append("  方式: ").append(s.backend).append('\n')
+                    .append("  前台: ").append(fg).append('\n')
+                    .append("  尺寸: ").append(s.bitmap.getWidth()).append('x').append(s.bitmap.getHeight())
+                    .append("（缩略图 ").append(small.getWidth()).append('x').append(small.getHeight()).append("）\n");
+            if (wantFull) {
+                final android.graphics.Bitmap orig = s.bitmap;
+                new Thread(() -> {
+                    try {
+                        java.io.File full = Screenshot.save(orig, "shot-full.png");
+                        Log.i(TAG, "原图已保存: " + full.getAbsolutePath());
+                    } catch (Throwable t) {
+                        Log.w(TAG, "保存原图失败", t);
+                    } finally {
+                        try { orig.recycle(); } catch (Throwable ignore) { }
+                    }
+                }, "shot-full").start();
+                out.append("  原图: ").append(new java.io.File(Screenshot.DIR, "shot-full.png")
+                                      .getAbsolutePath())
+                   .append("（后台写盘中，稍等一下再读）\n");
+            } else {
+                // 不需要原图 → 立刻回收，别占内存
+                s.bitmap.recycle();
+                out.append("  原图: 未生成（要的话加 ?full=1）\n");
+            }
+            return out.toString();
         } catch (Throwable t) {
             return "ERROR 保存截图失败: " + t + "\n";
+        }
+    }
+
+    /**
+     * 「看一段屏幕」：连续抓帧 → 挑关键帧 → 拼成一张分镜表。
+     *
+     * <h3>为什么放在设备端做</h3>
+     * 客户端版（每 500ms 调一次 {@code /shot}）实测 10 秒要 15.6 秒才跑完，
+     * 因为每帧都要走 HTTP + 落盘 + 在容器里解 PNG。设备端手里就是原生像素，
+     * 比"先传出去再比"更省更准，也不必每帧落盘（原来 2fps 约 70MB/分钟的闪存写入）。
+     *
+     * <h3>线程与节流</h3>
+     * 这个方法在请求线程里跑（不是主线程），中间的 {@code sleep} 是必须的：
+     * 无障碍截图有系统节流，间隔小于 ~300ms 就开始**静默丢帧**，所以 fps 上限压到 3。
+     *
+     * <h3>为什么复用上一次的缩略图做差异基准</h3>
+     * 拿每一帧都和"上一采样帧"比（而不是和第一帧比），是因为要看的是
+     * "**画面什么时候变了**"（翻页/弹窗/视频换镜头），而不是"和开头差多少"。
+     */
+    private static String watch(Context ctx, java.util.Map<String, String> p) {
+        java.util.Set<String> allow = allowed(ctx);
+        if (allow.isEmpty()) {
+            return "ERROR 白名单为空：请先在 DSH 设置 →「手机控制」里勾选允许操作的应用\n";
+        }
+        String fg = foreground(ctx);
+        if (fg == null || fg.isEmpty() || !allow.contains(fg)) {
+            return "ERROR 当前前台应用 [" + fg + "] 不在白名单里，已拒绝\n";
+        }
+
+        int seconds = clampInt(p.get("seconds"), 10, 1, 60);
+        int fps = clampInt(p.get("fps"), 2, 1, 3);          // 上限 3：见方法注释的节流说明
+        int threshold = clampInt(p.get("threshold"), 8, 0, 255);
+        int maxFrames = clampInt(p.get("maxFrames"), 12, 1, 40);
+        int cols = clampInt(p.get("cols"), 3, 1, 6);
+        int cellW = clampInt(p.get("w"), 360, 120, 1080);
+
+        long t0 = System.currentTimeMillis();
+        long intervalMs = 1000L / fps;
+        int total = Math.max(1, seconds * fps);
+        java.util.List<Storyboard.Frame> frames = new java.util.ArrayList<>();
+        java.util.List<android.graphics.Bitmap> shots = new java.util.ArrayList<>();
+        byte[] prevGray = null;
+        String lastErr = null;
+
+        for (int i = 0; i < total; i++) {
+            long target = t0 + (long) i * intervalMs;
+            long wait = target - System.currentTimeMillis();
+            if (wait > 0) {
+                try { Thread.sleep(wait); } catch (InterruptedException ie) { break; }
+            }
+            Screenshot.Shot s = Screenshot.capture(ctx);
+            if (s.bitmap == null) {
+                lastErr = s.error;
+                continue;
+            }
+            // 每帧统一缩到一个小宽度：拼图用 cellW，算差异用固定的小灰度图
+            android.graphics.Bitmap cell = Screenshot.downscale(s.bitmap, cellW);
+            s.bitmap.recycle();
+            if (cell == null) continue;
+            byte[] gray = gray32(cell);
+            int d = (prevGray == null) ? 255 : Storyboard.diff(prevGray, gray);
+            prevGray = gray;
+            frames.add(new Storyboard.Frame(i, System.currentTimeMillis() - t0, d));
+            shots.add(cell);
+        }
+
+        if (shots.isEmpty()) {
+            return "ERROR 一帧都没抓到" + (lastErr == null ? "" : "：" + lastErr) + "\n";
+        }
+
+        java.util.List<Storyboard.Frame> keys = Storyboard.pick(frames, threshold, maxFrames);
+
+        // 拼图：把关键帧画到一张画布上（每格左上一个时间戳，便于按时间线读）
+        int cw = shots.get(0).getWidth();
+        int ch = shots.get(0).getHeight();
+        int gap = 6, pad = 6;
+        Storyboard.Layout lay = Storyboard.layout(keys.size(), cols, cw, ch, gap, pad);
+        android.graphics.Bitmap sheet = android.graphics.Bitmap.createBitmap(
+                lay.canvasW, lay.canvasH, android.graphics.Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas canvas = new android.graphics.Canvas(sheet);
+        canvas.drawColor(0xFF101012);
+        android.graphics.Paint text = new android.graphics.Paint();
+        text.setColor(0xFFE8E8EA);
+        text.setTextSize(Math.max(10f, cw * 0.045f));
+        text.setAntiAlias(true);
+        java.util.List<String> keyPaths = new java.util.ArrayList<>();
+        for (int k = 0; k < keys.size(); k++) {
+            Storyboard.Frame f = keys.get(k);
+            int x = pad + lay.x(k), y = pad + lay.y(k);
+            android.graphics.Bitmap bmp = shots.get(Math.min(f.index, shots.size() - 1));
+            canvas.drawBitmap(bmp, x, y, null);
+            String label = String.format(java.util.Locale.ROOT, "%.1fs Δ%d", f.atMs / 1000.0, f.diff);
+            canvas.drawText(label, x + 4, y + text.getTextSize() + 2, text);
+        }
+
+        String sheetPath = null;
+        try {
+            java.io.File dir = new java.io.File(Screenshot.DIR);
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+            java.io.File out = new java.io.File(dir, "storyboard.png");
+            try (java.io.FileOutputStream os = new java.io.FileOutputStream(out)) {
+                sheet.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, os);
+            }
+            sheetPath = out.getAbsolutePath();
+            // 关键帧单独也留一份（agent 想放大看某一张时用）
+            for (Storyboard.Frame f : keys) {
+                java.io.File one = new java.io.File(dir, "key-" + f.index + ".png");
+                try (java.io.FileOutputStream os = new java.io.FileOutputStream(one)) {
+                    shots.get(Math.min(f.index, shots.size() - 1))
+                         .compress(android.graphics.Bitmap.CompressFormat.PNG, 100, os);
+                }
+                keyPaths.add(one.getAbsolutePath());
+            }
+        } catch (Throwable t) {
+            return "ERROR 写分镜表失败: " + t + "\n";
+        } finally {
+            sheet.recycle();
+            for (android.graphics.Bitmap b : shots) { try { b.recycle(); } catch (Throwable ignore) { } }
+        }
+
+        StringBuilder head = new StringBuilder();
+        head.append("OK 看完了 ").append(seconds).append(" 秒（采样 ").append(frames.size())
+            .append(" 帧 @" ).append(fps).append("fps，挑出 ").append(keys.size()).append(" 张关键帧）\n")
+            .append("  分镜表: ").append(sheetPath)
+            .append("\n  （用 read_image 读这张图就能一次看完整个流程；"
+                    + "单帧原图在 key-*.png，要放大细节时读它）\n")
+            .append("  前台: ").append(fg).append('\n');
+        String json = Storyboard.toJson(frames, fps, threshold, sheetPath, keyPaths);
+        return head.append("  元数据:\n").append(json).toString();
+    }
+
+    /** 把缩略图变成 32×32 灰度（算帧间差异用）。 */
+    private static byte[] gray32(android.graphics.Bitmap src) {
+        android.graphics.Bitmap g = android.graphics.Bitmap.createScaledBitmap(src, 32, 32, true);
+        int[] px = new int[32 * 32];
+        g.getPixels(px, 0, 32, 0, 0, 32, 32);
+        g.recycle();
+        byte[] out = new byte[px.length];
+        for (int i = 0; i < px.length; i++) {
+            int c = px[i];
+            int r = (c >> 16) & 0xFF, gg = (c >> 8) & 0xFF, b = c & 0xFF;
+            // 亮度权重：人眼对绿最敏感，转写/挑帧只需要"看起来变了没"
+            out[i] = (byte) ((r * 299 + gg * 587 + b * 114) / 1000);
+        }
+        return out;
+    }
+
+    private static int clampInt(String v, int def, int lo, int hi) {
+        try {
+            int n = Integer.parseInt(v == null ? "" : v.trim());
+            return Math.max(lo, Math.min(hi, n));
+        } catch (Throwable t) {
+            return def;
         }
     }
 
@@ -790,6 +1012,196 @@ public final class PhoneBridge {
                 || p.contains("chooser");
     }
 
+    /** 特权命令的执行开关（用户可在「手机权限 → 特权命令」里关掉）。 */
+    static final String KEY_ALLOW_SH = "allow_priv_sh";
+
+    static boolean allowPrivSh(Context c) {
+        try {
+            return c.getSharedPreferences(DshService.PREFS, Context.MODE_PRIVATE)
+                    .getBoolean(KEY_ALLOW_SH, true);
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    static void setAllowPrivSh(Context c, boolean on) {
+        c.getSharedPreferences(DshService.PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_ALLOW_SH, on).apply();
+    }
+
+    /**
+     * 特权命令：{@code /sh?cmd=<命令>}。
+     *
+     * <h3>为什么这条走 App 而不是插件直连</h3>
+     * Shizuku 的连接只有 App 进程有，容器里的插件拿不到；而且按这套工程一贯的
+     * 设计约定，**能力边界必须留在 App 侧**（插件跑在容器里，改一行就能绕开
+     * 自己写的检查）。所以插件只做"转发一个 HTTP 请求"。
+     *
+     * <h3>能力边界（必须在工具描述里对模型讲清楚）</h3>
+     * {@code execShell} 拿到的身份是 **shell（uid 2000）**，等价于 {@code adb shell}：
+     * <ul>
+     *   <li>能读 {@code /sdcard}、{@code /data/local/tmp}、跑 {@code pm}/{@code am}/{@code appops}/{@code settings}；</li>
+     *   <li>**读不到**别的应用的私有目录 {@code /data/data/<包名>} —— 那是 root 域，
+     *       shell 身份同样进不去（这条不许在 UI 上吹成"能访问私有目录"）；</li>
+     *   <li>拿不到 root 的设备上，它能做的上限就是 adb 能做的那些。</li>
+     * </ul>
+     */
+    private static String privSh(Context ctx, java.util.Map<String, String> p) {
+        String backend = ShizukuBridge.privilegedBackend(ctx);
+        String cmd = p.get("cmd");
+        if (cmd == null || cmd.trim().isEmpty()) {
+            boolean can = ShizukuBridge.hasPermission() || ShizukuBridge.rootAvailable(false);
+            return "特权命令状态\n"
+                 + "  后端      : " + backend + "\n"
+                 + "  可用      : " + (can ? "是" : "否（先启动 Shizuku 并授权）") + "\n"
+                 + "  用户开关  : " + (allowPrivSh(ctx) ? "已允许" : "已禁止") + "\n"
+                 + "  用法      : /sh?cmd=ls%20-l%20/sdcard\n"
+                 + "  注意      : 身份是 shell（等价 adb shell），读不到别的应用私有目录\n";
+        }
+        if (!allowPrivSh(ctx)) {
+            return "ERROR 特权命令已被用户关闭（手机权限 → 特权命令）";
+        }
+        if (!ShizukuBridge.hasPermission() && !ShizukuBridge.rootAvailable(false)) {
+            return "ERROR 没有可用的特权后端：请先启动 Shizuku 并授权（手机权限页可一键授权）";
+        }
+        try {
+            String out = ShizukuBridge.execShell(ctx, cmd);
+            return (out == null || out.trim().isEmpty()) ? "(命令执行完毕，无输出)" : out;
+        } catch (Throwable t) {
+            return "ERROR 执行失败: " + t;
+        }
+    }
+
+    /**
+     * 私有目录读写：{@code /fs?op=ls|read|write|rm&path=<路径>&data=<写内容>}。
+     *
+     * <h3>为什么要限制根</h3>
+     * 不加限制就是一个"任意路径读写"的后门。这里只放行两类：
+     * <ul>
+     *   <li><b>共享存储</b>：{@code /sdcard} 及其别名（装了 MANAGE_EXTERNAL_STORAGE 后
+     *       连 {@code /sdcard/Android/data} 也能进）；</li>
+     *   <li><b>容器根</b>：{@code /root/...} → 映射到 App 私有的 {@code <base>/rootfs/root/...}，
+     *       这是 DSH 自己的工作区与配置所在。</li>
+     * </ul>
+     */
+    private static String privFs(Context ctx, java.util.Map<String, String> p) {
+        String op = p.get("op");
+        if (op == null || op.trim().isEmpty()) op = "ls";
+        String path = p.get("path");
+        if (path == null || path.trim().isEmpty()) {
+            return "ERROR 缺少 path\n"
+                 + "用法: /fs?op=ls&path=/sdcard\n"
+                 + "     /fs?op=read&path=/sdcard/a.txt\n"
+                 + "     /fs?op=write&path=/sdcard/a.txt&data=hello\n"
+                 + "     /fs?op=rm&path=/sdcard/a.txt\n"
+                 + "允许的根: /sdcard（含 Android/data）与 /root（容器内）\n";
+        }
+        java.io.File f = resolveFsPath(ctx, path.trim());
+        if (f == null) {
+            return "ERROR 路径不在允许范围内（只允许共享存储 /sdcard 与容器路径 /root）";
+        }
+        try {
+            switch (op) {
+                case "ls": {
+                    java.io.File[] kids = f.listFiles();
+                    if (kids == null) return "ERROR 不是目录或无法读取: " + f;
+                    java.util.Arrays.sort(kids, (a, b) ->
+                            a.getName().compareToIgnoreCase(b.getName()));
+                    StringBuilder sb = new StringBuilder();
+                    sb.append(f.getAbsolutePath()).append("  共 ").append(kids.length).append(" 项\n");
+                    for (java.io.File k : kids) {
+                        sb.append(k.isDirectory() ? "  [D] " : "  [F] ")
+                          .append(k.getName());
+                        if (!k.isDirectory()) sb.append("  ").append(k.length()).append("B");
+                        sb.append('\n');
+                    }
+                    return sb.toString();
+                }
+                case "read": {
+                    if (!f.isFile()) return "ERROR 不是文件: " + f;
+                    if (f.length() > 512 * 1024) {
+                        return "ERROR 文件太大（" + (f.length() / 1024) + " KB），"
+                             + "本接口上限 512 KB；大文件请用 read_image / 面板预览";
+                    }
+                    byte[] b = new byte[(int) f.length()];
+                    try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
+                        int off = 0;
+                        while (off < b.length) {
+                            int n = in.read(b, off, b.length - off);
+                            if (n < 0) break;
+                            off += n;
+                        }
+                    }
+                    return new String(b, "UTF-8");
+                }
+                case "write": {
+                    String data = p.get("data");
+                    if (data == null) data = "";
+                    java.io.File parent = f.getParentFile();
+                    if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                        return "ERROR 建父目录失败: " + parent;
+                    }
+                    try (java.io.FileOutputStream out = new java.io.FileOutputStream(f)) {
+                        out.write(data.getBytes("UTF-8"));
+                    }
+                    return "OK 已写入 " + f.getAbsolutePath() + "（" + data.getBytes("UTF-8").length + " B）";
+                }
+                case "rm": {
+                    if (!f.exists()) return "ERROR 不存在: " + f;
+                    if (f.isDirectory()) {
+                        java.io.File[] kids = f.listFiles();
+                        if (kids != null && kids.length > 0) {
+                            return "ERROR 目录非空，拒绝递归删除（保护性限制）: " + f;
+                        }
+                    }
+                    return f.delete() ? "OK 已删除 " + f.getAbsolutePath() : "ERROR 删除失败: " + f;
+                }
+                default:
+                    return "ERROR 未知 op: " + op + "（可用 ls / read / write / rm）";
+            }
+        } catch (Throwable t) {
+            return "ERROR " + t;
+        }
+    }
+
+    /**
+     * 把请求里的路径解析成 File，并**校验它落在允许的根之内**。
+     *
+     * <p>校验用的是 canonical path 前缀比对，这样 {@code /sdcard/../data} 这类
+     * 用 {@code ..} 绕出来的路径也会被挡住。
+     */
+    private static java.io.File resolveFsPath(Context ctx, String path) {
+        try {
+            // 容器路径 → App 私有 rootfs
+            java.io.File base = Env.base(ctx);
+            String host = path;
+            if (path.equals("/root") || path.startsWith("/root/")) {
+                host = new java.io.File(base, "rootfs").getAbsolutePath()
+                        + path.substring("/root".length());
+            } else if (!path.startsWith("/sdcard")
+                    && !path.startsWith("/storage/emulated/0")
+                    && !path.startsWith("/data/local/tmp")) {
+                return null;
+            }
+            java.io.File f = new java.io.File(host);
+            String canon = f.getCanonicalPath();
+            // 允许根（canonical 形式）
+            String[] roots = {
+                    new java.io.File("/sdcard").getCanonicalPath(),
+                    "/storage/emulated/0",
+                    "/data/local/tmp",
+                    new java.io.File(base, "rootfs/root").getAbsolutePath(),
+            };
+            for (String r : roots) {
+                if (canon.equals(r) || canon.startsWith(r + java.io.File.separator)) return f;
+            }
+            return null;
+        } catch (Throwable t) {
+            Log.w(TAG, "路径解析失败: " + path, t);
+            return null;
+        }
+    }
+
     private static String dispatch(Context ctx, String path, java.util.Map<String, String> p) {
         /*
          * 截屏放在最前面，**不跟着"操作后端"走**。
@@ -840,8 +1252,73 @@ public final class PhoneBridge {
             return VScreen.bridge(ctx, p);
         }
 
+        /*
+         * 实时进度悬浮条（灵动岛）开关：/hud?on=1 开 / on=0 关 / 无参查状态。
+         * 它只读容器写出来的 hud.json，不含任何手机操作，所以**不套白名单**。
+         */
+        if ("/hud".equals(path)) {
+            String on = p.get("on");
+            if ("1".equals(on) || "true".equals(on)) {
+                String e = HudOverlayService.start(ctx);
+                if (e != null) return "ERROR " + e + "\n";
+                return "OK 实时进度悬浮条已开启\n";
+            }
+            if ("0".equals(on) || "false".equals(on)) {
+                HudOverlayService.stop(ctx);
+                return "OK 实时进度悬浮条已关闭\n";
+            }
+            boolean can = android.os.Build.VERSION.SDK_INT < 23
+                    || android.provider.Settings.canDrawOverlays(ctx);
+            return "HUD 悬浮条: " + (HudOverlayService.isRunning() ? "运行中" : "未开启")
+                    + " | 悬浮窗权限: " + (can ? "已授权" : "未授权") + "\n";
+        }
+
+        /*
+         * 特权命令 / 私有目录读写。
+         *
+         * 这两条**不套应用白名单** —— 白名单管的是"操作哪个 App 的界面"，
+         * 而这两条是设备级能力，套上去只会让人误解边界。
+         * 真正的边界在各自的实现里（/sh 有用户开关 + 后端检查，/fs 有根目录白名单）。
+         */
+        if ("/sh".equals(path)) {
+            return privSh(ctx, p);
+        }
+        if ("/fs".equals(path)) {
+            return privFs(ctx, p);
+        }
+
         if ("/shot".equals(path)) {
             return shot(ctx, p);
+        }
+
+        /*
+         * 「看一段」：设备端连续抓帧 → 本地算帧间差异 → 只留关键帧 → 拼成一张分镜表。
+         *
+         * ┌─ 出处 ────────────────────────────────────────────────────────────────┐
+         * │ 这个设计**不是我自己想的**，来自群友 **古德里安** 的建议文档：            │
+         * │   《07-建议-让设备端挑帧(3).md》                                      │
+         * │ 他先量了数据、指出瓶颈，再给出"把挑帧下沉到设备端"的方案，还附了一份    │
+         * │ 用户态参考实现（dsh-phone-plus 的 phone_watch）。本方法就是把它搬进     │
+         * │ Java —— 同一套逻辑跑在设备端，省掉每帧的 HTTP + 落盘 + 容器解码。        │
+         * │                                                                        │
+         * │ ⚠️ 备注这条是因为**之前漏了**：第一版只写了"群友实测"没写是谁、          │
+         * │ 出处也没留，后来根本查不到这个设计从哪来。此后凡采纳外部建议都记名+记文档。│
+         * └────────────────────────────────────────────────────────────────────────┘
+         *
+         * 为什么值得下沉（古德里安文档里的实测，2026-10-05）：
+         *   原来的客户端做法是"每 500ms 调一次 /shot"，每帧都要走一次 HTTP + 落一次盘 +
+         *   在容器里解码算差异 —— 实测 `phone_watch(10 秒)` 端到端 15.6 秒（比视频本身还长），
+         *   平均每帧 977ms，其中截图 550~700ms、容器解 PNG 232ms。
+         *   瓶颈不是"解码"，而是"每帧都要走一次 HTTP + 落一次盘 + 传一份文件"。
+         *   设备端拿的是**原生像素**，比"客户端先解码再比"更省更准，而且不用每帧落盘
+         *   （原来连续看屏幕约 70 MB/分钟）。
+         *
+         * 参数：seconds（默认 10）、fps（默认 2，**上限 3** —— 无障碍截图有系统节流，
+         * 间隔小于 ~300ms 就开始丢帧）、threshold（默认 8）、maxFrames（默认 12）、
+         * cols（默认 3）、w（每格宽，默认 360）。
+         */
+        if ("/watch".equals(path)) {
+            return watch(ctx, p);
         }
 
         /*
@@ -1175,8 +1652,12 @@ public final class PhoneBridge {
             }
             default:
                 return "ERROR 404: 未知接口 " + path + "\n"
-                     + "可用: /status /ui /windows /shot /tap?x&y /click?text /swipe?x1&y1&x2&y2&ms "
-                     + "/text?value /key?name /apps /open?q=应用名或包名\n";
+                     + "可用: /status /ui /windows /shot?full=1 /watch?seconds=10&fps=2 "
+                     + "/tap?x&y /click?text /swipe?x1&y1&x2&y2&ms "
+                     + "/text?value /key?name /apps /open?q=应用名或包名 /hud?on=1|0\n"
+                     + "/sh?cmd=命令 /fs?op=ls|read|write|rm&path=路径\n"
+                     + "提示: 连续截图请勿快于约 1~2fps（无障碍截图有系统节流，"
+                     + "间隔小于 ~300ms 会静默丢帧）；要看一段就直接用 /watch。\n";
         }
     }
 }
