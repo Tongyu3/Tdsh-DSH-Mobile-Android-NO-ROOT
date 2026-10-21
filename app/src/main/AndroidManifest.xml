@@ -48,6 +48,12 @@
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
 
     <!--
+      「所有文件访问」：让 DSH 能进 /sdcard/Android/data 与 obb 这类
+      普通存储权限够不到的目录。属于敏感权限，系统设置里要用户手动开一次。
+    -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <!--
       麦克风：**只声明，安装时不会授予任何东西**。
       Android 6+ 的危险权限本来就必须运行时申请，所以这不会让 App
       "一装上就能听"；它只是让"申请"这件事成为可能。
@@ -63,6 +69,23 @@
         · 或者用户主动去「手机控制 → 麦克风权限」点一下。
     -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!--
+      音频设置：**普通权限，装上即生效，不需要用户手动授权**。
+      它修的是 GitHub issue #4「语音输入启动失败：Could not start audio source」。
+
+      Chromium 从 100 多版起，选择输入/输出音频设备时要走
+      AudioManager.setCommunicationDevice()（以及早期的 setMode/setSpeakerphoneOn），
+      而 AudioManagerAndroid 在真正下手前会检查：
+          requires MODIFY_AUDIO_SETTINGS and RECORD_AUDIO
+      两条缺一条就直接 return false → 采集链路建不起来 → Blink 把它映射成
+      "Could not start audio source" → 页面上就是「语音识别失败」。
+
+      症状极具误导性：RECORD_AUDIO 明明已授权（appops=foreground、界面也显示已授予），
+      因为真正缺的是这一条**从来没申请过的普通权限**。
+      录制屏内声音（AudioCapture）的上混/下混也需要它。
+    -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <!-- DSH Web UI 走 http://127.0.0.1:<port>，需要允许明文回环流量 -->
     <application
@@ -86,9 +109,23 @@
           MainActivity 仍然 exported=true：老版本留下的桌面快捷方式指向的就是它，
           不改的话用户升级后那一个图标会点不开。
         -->
+        <!--
+          ⚠️ **launchMode 必须是 singleTask**（2026-10-15 修，GitHub issue #3）。
+
+          原来没设，走默认 standard —— 每次 startActivity 都**新建一个 MainActivity 实例**：
+            · 点通知栏「正在运行」→ 新实例 → 新 WebView → 全新加载 → 没有会话的落地页
+            · 桌面图标有 30 个 activity-alias 都指向本 Activity，从不同图标进来也会各开一个
+            · 新实例是空白会话页，旧实例还活着 —— 用户看到的"像两个独立应用实例、
+              返回键像在退出另一个应用"就是两个实例叠在任务栈里
+            · 「返回两次才恢复」= 正在弹出第二个实例
+
+          singleTask 之后全局只有一个实例：再次启动只走 onNewIntent 把它提前，
+          WebView 和当前会话原样保留，不会重新加载。
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale|layoutDirection|locale|mcc|mnc|touchscreen"
             android:label="@string/app_name" />
 
@@ -659,6 +696,20 @@
             android:exported="false" />
 
         <!--
+          实时进度悬浮条（灵动岛）：只读胶囊，浮在其它应用上方显示 agent 状态。
+          数据读 /sdcard/.dsh-phone/hud.json（容器里 watchdog / phone_hud 写）。
+          开关走 PhoneBridge 的 /hud?on=1|0，以及「手机权限」页的开关。
+          权限复用上面已声明的 SYSTEM_ALERT_WINDOW。
+
+          与上面的 OverlayService 的区别：那个是**可交互**的 DSH 浮窗；
+          这个是**完全只读**的胶囊（NOT_FOCUSABLE + NOT_TOUCHABLE），
+          浮在谁上面都不影响下层应用的交互。
+        -->
+        <service
+            android:name=".HudOverlayService"
+            android:exported="false" />
+
+        <!--
           手机控制的无障碍服务。
           注意：它不会修改系统任何东西 —— 只是请求用户在「设置 → 无障碍」里手动开启，
           真正的授权边界是 App 内的应用白名单。
@@ -681,6 +732,12 @@
             android:name=".BallIconActivity"
             android:exported="false"
             android:label="悬浮球图标" />
+
+        <!-- 悬浮球设置页：图标/大小/气泡大小/自动出现/操作教程，都在这里 -->
+        <activity
+            android:name=".BallSettingsActivity"
+            android:exported="false"
+            android:label="悬浮球设置" />
 
         <!-- 白名单配置界面 -->
         <activity
@@ -759,6 +816,17 @@
             android:name=".PhonePermActivity"
             android:exported="false"
             android:label="手机权限" />
+
+        <!--
+          录制屏幕内声音：**只负责向系统要投影令牌**，拿到就自己结束。
+          半透明主题 + 不进最近任务 —— 用户不该看到任何界面，只看到系统确认框。
+        -->
+        <activity
+            android:name=".AudioCaptureActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!--
           DSH 内置输入法：唯一目的是"用键盘的方式"把文字送进微信这类
