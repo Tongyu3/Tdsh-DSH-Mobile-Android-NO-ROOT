@@ -25,8 +25,13 @@ android {
         applicationId "com.dshmobile.probe"
         minSdk 24
         targetSdk 28          // ← 不许改大，见上方注释
-        versionCode 53
-        versionName "0.4.1"
+        /*
+         * 版本策略：0.4.1.wan 是给群友单独开的灵动岛版（versionCode 53）。
+         * 这一支 0.4.2 是主线：插件生态、文件预览与下载、权限扩展、悬浮球改造。
+         * versionCode 55 比 0.4.1(53) 高，能覆盖安装且保留数据。
+         */
+        versionCode 59
+        versionName "0.4.7"
     }
 
     signingConfigs {
