@@ -28,6 +28,7 @@
 │              └─ proot ── Ubuntu rootfs ── Node ── dsh web│
 │                                                          │
 │  可选：无障碍服务 + 回环控制桥 → 让 agent 操作指定 App   │
+│  可选：本地 TTS（sherpa-onnx）→ 离线把回复念出来          │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -38,13 +39,20 @@
 
 - 完整 DSH Web UI，对话 / 工作区切换 / 会话管理
 - **附件**：图片、视频、音频、文档都能加进会话（从「最近 / 图片 / 相册 / 文件管理」哪个入口选都一样）
+- **语音朗读**：回复生成完自动念出来（输入框下面的小喇叭开关）。四种引擎可切 ——
+  **系统语音**（离线/免费/最快）、**本地模型**（手机自己跑开源 TTS，全程离线，见下）、
+  **云端 TTS**（OpenAI 兼容，如硅基流动 CosyVoice）、**自定义接口**（GPT-SoVITS / RVC 那类）
+- **本地 TTS 模型**：内置**纳西妲音色**（ZipVoice 零样本克隆，中英双语，点一下装好）；
+  也可以把自己的开源模型链接（`.tar.bz2` / `.zip`）粘进去，自动下载解包、自动认类型（VITS / Matcha / ZipVoice）。
+  推理只在你按朗读时才占 CPU、只用 2 个核心、念完 3 分钟把模型卸出内存 —— 不做常驻线程
 - 读写手机文件（`/sdcard` 即内部存储）
 - **右侧栏「手机文件」插件**：像文件管理器一样浏览手机存储，多选后一键把路径加进会话（只读，不删改你的文件）
 - **插件市场**：在手机上搜索、一键安装社区写的 DSH 插件
 - **插件自救**：装到与当前 DSH 不兼容的插件、界面进不去时，App 会**自动停用第三方插件并重启**，界面自己回来（可一键恢复）
 - **界面自愈**：白屏/断线自动恢复 —— 容器掉了会自动重连、界面渲染进程被系统回收会自动重建
 - **可选**：让 agent 操作你指定的 App（无障碍 + 白名单，名单外一律拒绝）
-- **无障碍守护**：厂商把无障碍开关关掉时自动写回（实测约 0.3 秒恢复，**无次数上限**）
+- **无障碍守护**：厂商把无障碍开关关掉时自动写回（实测约 0.3 秒恢复，**无次数上限**）；
+  连「设置显示已开启、服务其实没绑上」这种也会认出来并强制重挂
 - **两种操作后端可切换**：无障碍（快）或 直接命令 / Shizuku（不被厂商策略影响）
 - **兼容老 WebView**：内置垫片补齐 `Iterator` / `AbortSignal.any` 等新 API
 - **手机与平板同一个包**：平板上会话列表常驻可见，本机设置入口一个不少
@@ -57,12 +65,14 @@
 
 | 限制 | 说明 |
 |---|---|
-| **仅 arm64** | 只带了 arm64 的 proot 与 Node |
+| **仅 arm64** | 只带了 arm64 的 proot、Node 与 TTS 原生库 |
 | **Android 7.0+** | `minSdk 24` |
+| **安装包约 38 MB** | 0.4.8 之前是 6.9 MB，多出来的是本地 TTS 的原生推理库（ONNX Runtime + sherpa-onnx），不加就没法在手机上跑模型；只保留 arm64 |
 | **`targetSdk` 固定 28** | Android 10+ 的 W^X 禁止 targetSdk≥29 的应用执行自己数据目录里的二进制。这是硬要求，**因此永远无法上架 Google Play**，只能侧载 |
 | **QQ / 微信的界面读不出来** | 实测这两个 App 对 `uiautomator` 和无障碍**两条路都返回空树**（微信只有 407 字节的根节点），是它们自己屏蔽的。所以这两者目前无法自动化，其他 App 不受影响 |
 | **vivo / iQOO 会关无障碍** | 这类 App 一进前台，vivo 会把无障碍主开关置 0。App 会**自动补回**（见下），但补回后仍受上一条限制 |
 | **第三方插件可能与当前 DSH 不兼容** | 老插件（为 0.1.x 写的）会让界面起不来。App 会自动把可疑插件停掉并恢复界面，停用清单可在「手机权限 → 插件安全模式」里一键恢复 |
+| **本地 TTS 模型要单独下载** | 内置的纳西妲音色是「点安装时下载一次」（约 160 MB，含声码器），不下也能用系统语音 / 云端 TTS |
 | 首次启动需联网 | 约 150 MB，且需要自备 DeepSeek API Key |
 
 ### 关于无障碍守护需要的一次性授权
@@ -85,7 +95,7 @@ adb shell pm grant com.dshmobile.probe android.permission.WRITE_SECURE_SETTINGS
 
 ## 安装（普通用户）
 
-去 [**Releases**](../../releases) 下载最新的 `DeepSeek-Harness-*.apk`，传到手机点击安装。
+去 [**Releases**](../../releases) 下载最新的 `Tdsh-*.apk`，传到手机点击安装。
 
 详细的图文步骤（含 vivo「超级守护」怎么过、API Key 填在哪、工作区怎么选）见
 👉 **[docs/安装与使用说明.md](docs/安装与使用说明.md)**
@@ -105,8 +115,8 @@ adb shell pm grant com.dshmobile.probe android.permission.WRITE_SECURE_SETTINGS
 需要 **JDK 17** 和 Android SDK（`compileSdk 36`、`build-tools 36.0.0`）。
 
 ```bash
-git clone https://github.com/Tongyu3/DSH-Mobile-Android-NO-ROOT.git
-cd DSH-Mobile-Android-NO-ROOT
+git clone https://github.com/Tongyu3/Tdsh-DSH-Mobile-Android-NO-ROOT.git
+cd Tdsh-DSH-Mobile-Android-NO-ROOT
 
 # 指向你的 Android SDK
 echo "sdk.dir=/path/to/Android/Sdk" > local.properties
@@ -115,6 +125,12 @@ echo "sdk.dir=/path/to/Android/Sdk" > local.properties
 ./gradlew assembleRelease
 # 产物：app/build/outputs/apk/release/app-release.apk
 ```
+
+> ⚠️ **0.4.9 起构建还差一个文件：`app/libs/sherpa-onnx.aar`（约 47 MB）不随仓库分发。**
+> 它是 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) v2.0.1 官方
+> `sherpa-onnx-v2.0.1-android.tar.bz2` 里的 `jniLibs`（只要 `arm64-v8a`）+ `classes.jar`
+> 打成的 AAR。缺这个文件时 Gradle 会在依赖解析阶段直接报错。
+> 只保留 arm64 才能把安装包压在 38 MB 左右。
 
 **发布签名**：仓库**不含**任何密钥。要出正式包，在项目根放一个 `keystore.properties`：
 
@@ -147,16 +163,24 @@ Gradle wrapper 默认指向腾讯镜像（`mirrors.cloud.tencent.com`），开�
 | `app/src/main/java/.../PhonePermActivity.java` | 「手机权限」大类（白名单 / 插件市场 / 安全模式 / 复制运行日志…） |
 | `app/src/main/java/.../PhoneBridge.java` | 手机控制回环桥（token + 白名单） |
 | `app/src/main/java/.../DshAccessibilityService.java` | 无障碍服务（动作 + 界面树） |
-| `app/src/main/java/.../Priv.java` | 无障碍开关的读/写（自愈的能力层） |
-| `app/src/main/java/.../A11yGuard.java` | 无障碍守护看门狗（事件驱动 + 轮询，无次数上限） |
+| `app/src/main/java/.../Priv.java` | 无障碍开关的读/写/重绑（自愈的能力层） |
+| `app/src/main/java/.../A11yGuard.java` | 无障碍守护看门狗（事件驱动 + 轮询，含「设置开着但没绑上」的识别与重挂） |
 | `app/src/main/java/.../ShizukuBridge.java` | Shizuku 客户端（权限流 + 执行入口） |
 | `app/src/main/java/.../ShellUserService.java` | 以 shell 身份跑在独立进程里的命令服务 |
 | `app/src/main/aidl/.../IShellService.aidl` | 上面那个服务的接口（`destroy()` 事务码必须是 16777114） |
 | `app/src/main/java/.../ShellControl.java` | 「直接命令」后端（`uiautomator dump` + `input`，不依赖无障碍） |
+| `app/src/main/java/.../BallStage.java` | 悬浮球气泡的「阶段判定」纯逻辑类（带 PC 端离线自测） |
+| `app/src/main/java/.../AutoBall.java` | 悬浮球的进程/CPU 采样与热力判据 |
+| `app/src/main/java/.../Tts.java` | 语音朗读调度：系统语音 / 云端 / 自定义接口 / 交给本地引擎 |
+| `app/src/main/java/.../TtsLocal.java` | 本地 TTS 推理（sherpa-onnx `OfflineTts` + AudioTrack 播放，按需加载、用完卸载） |
+| `app/src/main/java/.../TtsModels.java` | 本地模型的下载 / 解包 / 类型识别 / 清单，以及内置纳西妲参考音色 |
 | **`plugin/dsh-phone/`** | 自带插件「手机控制」的源码（打包成 tgz 放进 APK） |
 | **`plugin/dsh-phone-files/`** | 自带插件「手机文件」的源码（右侧栏文件浏览） |
+| **`plugin/dsh-tts/`** | 自带插件「语音朗读」的源码（设置面板 + 本地模型管理，`plugin/dsh-tts-1.1.0.tgz`） |
 | **`tools/patch.js`** | **前端补丁的源文件**（构建时自动同步成 `app/src/main/assets/dsh-mobile.js`） |
 | **`app/src/main/assets/webview-shim.js`** | **WebView 兼容垫片**（补齐 `Iterator` / `AbortSignal.any` 等新 API） |
+| `app/src/main/assets/nahida.wav` | 内置的纳西妲参考音色（8 秒，ZipVoice 零样本克隆用） |
+| `app/libs/sherpa-onnx.aar` | 本地 TTS 的原生推理库（**不随仓库分发**，见上） |
 | `tools/cdp.mjs` | 用 Chrome DevTools 协议在 PC 上调试 WebView 的小工具（`--crash` 可用来验证渲染进程自愈） |
 | `tools/make-source-package.ps1` | 重新生成可上传的源码包 |
 | `tools/make-share-package.ps1` | 生成"分享包"（APK + 三份说明 + 截图 + Shizuku，发给朋友用的整包） |
@@ -191,6 +215,7 @@ Gradle wrapper 默认指向腾讯镜像（`mirrors.cloud.tencent.com`），开�
 | 存储读写 | 容器通过 proot 绑定 `/storage/emulated/0`，才能读写你的文件 | 只访问你指定路径；App 不主动上传任何文件 |
 | 无障碍 | 让 agent 读取界面并点击 | **只对你自己勾选的白名单应用生效**；名单外连界面树都读不到 |
 | 前台服务 | 让容器在后台存活 | 通知栏常驻 |
+| 联网（仅在你点「朗读」且选本地模型时） | 下载 TTS 模型文件 | 模型跑在手机本地，**朗读内容不出设备**；只有下载模型时才联网 |
 
 - **API Key 只存在手机本地的 App 私有目录**，由 App 作为环境变量传给容器里的 DSH，
   最终由 DSH 直接请求 `api.deepseek.com`。本项目没有任何自有服务器，代码可自行审计。
@@ -201,7 +226,8 @@ Gradle wrapper 默认指向腾讯镜像（`mirrors.cloud.tencent.com`），开�
 ## 许可证
 
 - 本仓库自身代码：**MIT**，见 [LICENSE](LICENSE)
-- 打包进 APK 的第三方二进制（**proot 为 GPLv2** 等）：见 [THIRD-PARTY.md](THIRD-PARTY.md) 与 [LICENSES/](LICENSES/)
+- 打包进 APK 的第三方二进制（**proot 为 GPLv2**、**sherpa-onnx / ONNX Runtime 为 Apache-2.0** 等）：
+  见 [THIRD-PARTY.md](THIRD-PARTY.md) 与 [LICENSES/](LICENSES/)
 
 ---
 
@@ -225,7 +251,10 @@ On first launch the app downloads and unpacks Ubuntu base + Node.js + DSH (~1–
 (reconnects when the container dies, rebuilds the renderer when Android reclaims it) ·
 **auto-recovers from incompatible plugins** by disabling them and restarting ·
 optional app automation behind an allow-list · accessibility self-repair on vivo/iQOO ·
-phone and tablet share one APK.
+**read-aloud TTS** with four engines — system voice, **fully on-device models**
+(sherpa-onnx: VITS / Matcha / ZipVoice zero-shot cloning, a bundled Nahida voice, or any
+open model you paste a link to), OpenAI-compatible cloud TTS, or a custom GPT-SoVITS-style
+endpoint · phone and tablet share one APK.
 
 **Install:** grab the latest APK from [Releases](../../releases).
 See [docs/安装与使用说明.md](docs/安装与使用说明.md) for a step-by-step guide (screenshots included).
@@ -237,6 +266,10 @@ echo "sdk.dir=/path/to/Android/Sdk" > local.properties
 ./gradlew assembleRelease
 ```
 
+> Note: since 0.4.9 the build also needs `app/libs/sherpa-onnx.aar` (~47 MB, arm64 only),
+> which is **not** committed — see the Chinese section above for how to assemble it from the
+> official sherpa-onnx v2.0.1 Android package.
+
 **Known limitations:**
 
 - `targetSdk` is pinned to **28** on purpose — Android 10+ W^X forbids apps with
@@ -244,7 +277,8 @@ echo "sdk.dir=/path/to/Android/Sdk" > local.properties
   Consequence: **this app can never ship on Google Play**, sideload only.
 - On **vivo/iQOO**, the system force-disables accessibility services when QQ/WeChat come to the
   foreground (anti-fraud policy), so those two apps can't be automated there. Other apps are fine.
-- arm64 only.
+- arm64 only. The APK is ~38 MB since on-device TTS was added (native inference libs).
 
 **License:** MIT for this repository's own code; bundled third-party binaries
-(**proot is GPLv2**) are covered in [THIRD-PARTY.md](THIRD-PARTY.md).
+(**proot is GPLv2**, **sherpa-onnx / ONNX Runtime are Apache-2.0**) are covered in
+[THIRD-PARTY.md](THIRD-PARTY.md).
