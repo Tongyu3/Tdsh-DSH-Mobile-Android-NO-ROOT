@@ -591,6 +591,14 @@ public final class Env {
     public static final String THINKING_TGZ = "dsh-thinking-1.0.1.tgz";
     public static final String THINKING_NAME = "dsh-thinking";
     /**
+     * 语音朗读插件（界面侧）：输入框下方的小喇叭 + 设置页「语音朗读」。
+     *
+     * <p>声音本身不在这里 —— 安卓 WebView 没有 speechSynthesis，
+     * 系统语音与云端 TTS 都由 {@link Tts} 走原生。插件只决定"读哪段、怎么读"。
+     */
+    public static final String TTS_TGZ = "dsh-tts-1.1.0.tgz";
+    public static final String TTS_NAME = "dsh-tts";
+    /**
      * 随 APK 内置的插件：{tarball 名, 包名}。
      * 加新插件只要在这里追加一行 + 跑 plugin\build-tgz.ps1。
      */
@@ -601,6 +609,7 @@ public final class Env {
             { VSCREEN_TGZ, VSCREEN_NAME },
             { ANDROID_ENV_TGZ, ANDROID_ENV_NAME },
             { THINKING_TGZ, THINKING_NAME },
+            { TTS_TGZ, TTS_NAME },
     };
 
     /**

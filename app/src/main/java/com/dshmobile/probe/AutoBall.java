@@ -99,6 +99,74 @@ public final class AutoBall {
     }
 
     /**
+     * 「容器是不是真的在烧 CPU」—— 给**阶段判定**用的平滑器。
+     *
+     * <h3>为什么单拍判据不够（GitHub issue：气泡 2–4 秒空转 34 分钟）</h3>
+     * 原来判阶段用 {@code heavyStreak >= 2}：连续两拍 CPU 增量超过间隔的 20% 就算"有任务"。
+     * 但容器里的 node **闲着也在轮询**，偶尔一次 GC / 一次写盘就会连着烧两拍，
+     * 于是阶段被反复判成"思考中"，再由"上一拍在跑、这一拍停了"判回"已完成"——
+     * 现场日志 34 分钟里 248 次切换，全是这条链。
+     *
+     * <p>单拍阈值怎么调都没用（调高就漏判真任务，调低就继续抖），
+     * 所以换成**滑动平均**：一次尖峰最多把均值顶上去一半，两三次零散尖峰仍到不了门槛；
+     * 真正在编译/跑工具时 CPU 是**持续**烧的，两拍就能过线。
+     *
+     * <p>另一个细节是**回落要快**：真干完了还慢吞吞地衰减，用户会看到"已完成"迟到好几秒。
+     * 所以连续两拍几乎无活动就直接重锤衰减（{@link #COOL_DECAY}）。
+     *
+     * <p>这类纯逻辑照规矩不 import android，可以在 PC 上跑自检（见 tools/BallStageSelfTest.java）。
+     */
+    public static final class Heater {
+        /** 连续烧过采样间隔的多少比例才算"在干活"。20% ≈ 一个核心的五分之一。 */
+        public static final double HOT_RATIO = 0.20;
+        /** 每拍的新读数占多少权重。0.45：一次尖峰顶不上去，两拍持续就过线。 */
+        private static final double ALPHA = 0.45;
+        /** 连续多少拍"几乎没有活动"就重锤回落。 */
+        private static final int COOL_STREAK = 2;
+        /** 重锤回落的系数。 */
+        private static final double COOL_DECAY = 0.35;
+
+        private double avg = 0.0;
+        private int cool = 0;
+
+        /**
+         * 喂一拍采样。
+         *
+         * @param dcpuMs 这一拍容器进程累计消耗的 CPU 毫秒
+         * @param dtMs   两拍之间的真实间隔（毫秒）
+         */
+        public void sample(long dcpuMs, long dtMs) {
+            if (dtMs <= 0) return;
+            double r = (double) dcpuMs / (double) dtMs;
+            if (r < 0) r = 0;
+            // 多核可以把 r 顶到 4 以上，截一下，免得一次多核编译把均值钉死在高位
+            if (r > 4.0) r = 4.0;
+            if (r < HOT_RATIO * 0.15) {
+                cool++;
+            } else {
+                cool = 0;
+            }
+            avg = avg * (1.0 - ALPHA) + r * ALPHA;
+            if (cool >= COOL_STREAK) avg *= COOL_DECAY;
+        }
+
+        /** 现在算不算"持续在烧"。 */
+        public boolean hot() {
+            return avg >= HOT_RATIO;
+        }
+
+        /** 平滑后的占用率（百分比，诊断日志用）。 */
+        public int pct() {
+            return (int) Math.round(avg * 100.0);
+        }
+
+        public void reset() {
+            avg = 0.0;
+            cool = 0;
+        }
+    }
+
+    /**
      * 最终决定：悬浮球现在该不该显示。
      *
      * @param autoMode    用户是否开着"自动"（默认开）

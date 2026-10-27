@@ -1,4 +1,4 @@
-﻿# 把 plugin/ 下的插件打成 npm tarball，供 APK 内置。
+# 把 plugin/ 下的插件打成 npm tarball，供 APK 内置。
 #
 # 为什么要有这个脚本：tarball 之前是手工打的，而"手工步骤"在这个项目里
 # 已经出过事（改了 patch.js 忘了同步 assets）。打包决定产物内容，
@@ -22,6 +22,14 @@ $assets = Join-Path $root 'DshMobile\app\src\main\assets'
 $plugins = @(
     @{ dir = 'dsh-phone';       files = @('package.json', 'index.js', 'cordis.patch.yml', 'README.md') },
     @{ dir = 'dsh-phone-files'; files = @('package.json', 'lib\index.js', 'lib\client.js', 'cordis.patch.yml', 'README.md') }
+    # 虚拟屏客户端（守护 dex 在 app\src\main\assets\vsd\，这个包只是 DSH 侧的工具）
+    @{ dir = 'dsh-vscreen';     files = @('package.json', 'index.js', 'cordis.patch.yml', 'README.md') }
+    # 环境预设：往 systemPrompt 注入"你在安卓手机上"那段（纯 host 侧）
+    @{ dir = 'dsh-android-env'; files = @('package.json', 'index.js', 'cordis.patch.yml', 'README.md') }
+    # 思考链：探针 + 只读诊断（纯 host 侧）
+    @{ dir = 'dsh-thinking';    files = @('package.json', 'index.js', 'cordis.patch.yml', 'README.md') }
+    # 语音朗读：输入框下方小喇叭 + 设置页（浏览器侧 UI，声音走 App 原生桥）
+    @{ dir = 'dsh-tts';         files = @('package.json', 'lib\index.js', 'lib\client.js', 'cordis.patch.yml', 'README.md') }
 )
 
 $stamped = @()

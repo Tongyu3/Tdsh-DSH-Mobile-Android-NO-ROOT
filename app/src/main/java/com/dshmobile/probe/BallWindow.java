@@ -240,6 +240,27 @@ public final class BallWindow {
     private static final BallStage.Throttle stageThrottle = new BallStage.Throttle();
     /** 被节流掉的阶段（等下一拍再补上），避免"阶段变了却没显示"。 */
     private static volatile int stagePending = -1;
+    /** 当前阶段是什么时候换上的 —— "最短驻留"去抖用。 */
+    private static volatile long stageChangedAt = 0L;
+
+    /**
+     * 同一阶段最短驻留多久才允许换下一阶段（毫秒）。
+     *
+     * <p>这是「气泡空转」的第二道防线：终态粘性（{@link BallStage#POST_DONE_HOLD_MS}）
+     * 管的是"只有 CPU 在抖时不许翻回思考中"，这一道管的是"就算所有信号都在抖，
+     * 也不许两秒内翻两次"。2.5 秒 ≈ 一次心跳多一点，人眼刚好不会觉得在抽。
+     *
+     * <p>「出错」不受这条限制：报错必须立刻出来，晚两秒就可能被用户当成没报错。
+     */
+    static final long MIN_DWELL_MS = 2_500L;
+
+    /** 套上最短驻留去抖，返回这一拍**真正该显示**的阶段。 */
+    private static int dwell(int raw, long now) {
+        if (raw == stageNow) return raw;
+        if (raw == BallStage.ERROR) return raw;
+        if (stageChangedAt > 0L && now - stageChangedAt < MIN_DWELL_MS) return stageNow;
+        return raw;
+    }
 
     /**
      * 长时间没有新进展就**自动隐藏阶段行**（用户要求"长时间无更新自动隐藏"）。
@@ -268,10 +289,13 @@ public final class BallWindow {
      */
     public static void updateStage(Context c, String lastLine, long lineAgeMs,
                                   boolean taskActive, boolean justFinished, String serviceState,
-                                  int webStage, long webAgeMs) {
+                                  int webStage, long webAgeMs, boolean pageBusy,
+                                  BallStage.Memo memo, int cpuPct) {
         try {
-            int stage = BallStage.detect(lastLine, lineAgeMs, taskActive, justFinished,
-                    serviceState, webStage, webAgeMs);
+            long now = System.currentTimeMillis();
+            int raw = BallStage.detect(lastLine, lineAgeMs, taskActive, justFinished,
+                    serviceState, webStage, webAgeMs, pageBusy, memo, now);
+            int stage = dwell(raw, now);
             String custom = null;
             try {
                 custom = c.getSharedPreferences(DshService.PREFS, Context.MODE_PRIVATE)
@@ -281,13 +305,13 @@ public final class BallWindow {
                 android.util.Log.w("DSH_BALL", "读阶段文案配置失败，用内置表", t);
             }
             String text = BallStage.text(stage, custom);
-            long now = System.currentTimeMillis();
             if (stageThrottle.shouldUpdate(stage, text, now)) {
                 boolean changed = stage != stageNow;
                 int from = stageNow;
                 stageNow = stage;
                 stageTextNow = text;
                 stageAt = now;
+                if (changed) stageChangedAt = now;
                 stagePending = -1;
                 /*
                  * 阶段变化的日志用**独立 tag**（GitHub issue 里点名要的 FloatBallStage）：
@@ -298,16 +322,20 @@ public final class BallWindow {
                 if (changed) {
                     android.util.Log.i("FloatBallStage", BallStage.name(from) + " → "
                             + BallStage.name(stage) + " / " + text
-                            + "（网页=" + (webStage < 0 ? "无" : BallStage.name(webStage))
+                            + "（原始=" + BallStage.name(raw) + "，网页="
+                            + (webStage < 0 ? "无" : BallStage.name(webStage))
                             + "，" + (webAgeMs == Long.MAX_VALUE ? "∞" : webAgeMs + "ms")
                             + "；输出行龄=" + (lineAgeMs == Long.MAX_VALUE ? "∞" : lineAgeMs + "ms")
-                            + "；有任务=" + taskActive + "）");
+                            + "；有任务=" + taskActive + "（网页忙=" + pageBusy
+                            + "，CPU=" + cpuPct + "%））");
                     trace(BallStage.name(from) + " → " + BallStage.name(stage)
                             + " / " + text
+                            + "  原始=" + BallStage.name(raw)
                             + "  网页=" + (webStage < 0 ? "无" : BallStage.name(webStage))
                             + "@" + (webAgeMs == Long.MAX_VALUE ? "∞" : webAgeMs + "ms")
                             + " 输出行龄=" + (lineAgeMs == Long.MAX_VALUE ? "∞" : lineAgeMs + "ms")
-                            + " 有任务=" + taskActive);
+                            + " 有任务=" + taskActive + "（网页忙=" + pageBusy
+                            + " CPU=" + cpuPct + "%）");
                 } else {
                     android.util.Log.d("FloatBallStage", "保持 " + BallStage.name(stage)
                             + " / " + text);
@@ -1184,6 +1212,16 @@ public final class BallWindow {
                 new GestureDetector.SimpleOnGestureListener() {
             @Override
             public boolean onSingleTapConfirmed(MotionEvent e) {
+                /*
+                 * 再复核一次"这真的是一次点击吗"（GitHub issue：滑一下跳到了别的页面）。
+                 *
+                 * 拖动时窗口跟着手指走，GestureDetector 用的是 **View 内坐标** ——
+                 * 内坐标几乎不动，永远到不了 touchSlop，于是它把拖动当成了单击。
+                 * 主防线是下面 onTouch 里的 cancelDrag()（一旦判定为拖动就给它补 ACTION_CANCEL），
+                 * 这里用 **屏幕坐标** 再兜一层：任何一次"按下点与抬手点真差了 6dp 以上"的，
+                 * 一律不算点击。
+                 */
+                if (tapMovedAway(e)) return false;
                 // 点一次 → 冒气泡（或收起气泡）
                 applyMode(mode == MODE_BUBBLE ? MODE_DOT : MODE_BUBBLE, true);
                 return true;
@@ -1191,7 +1229,8 @@ public final class BallWindow {
 
             @Override
             public boolean onDoubleTap(MotionEvent e) {
-                // 连点两次 → 回主界面（用户明确要的）
+                // 连点两次 → 回主界面（用户明确要的）；同样要排除"两次滑动被当成连点"
+                if (tapMovedAway(e)) return false;
                 openMain();
                 return true;
             }
@@ -1200,23 +1239,45 @@ public final class BallWindow {
             float downX, downY;
             int startBallX, startBallY;
             boolean moved;
+            /** 已被判定为拖动：本次手势剩下的所有事件都不再喂给 GestureDetector。 */
+            boolean dragging;
+
             @Override
             public boolean onTouch(View v, MotionEvent ev) {
+                /*
+                 * ⚠️ **不能无条件 gd.onTouchEvent(ev)**（GitHub issue 的根因 2）。
+                 *
+                 * 原来第一句就是它，而 ACTION_MOVE 分支会把窗口坐标跟着手指改 ——
+                 * GestureDetector 判"动没动"用的是 View 内坐标，窗口跟着走，
+                 * 内坐标就几乎不变 → 永远到不了 touchSlop → 抬手后照样发
+                 * onSingleTapConfirmed（切换气泡）；两次滑动还会落进 onDoubleTap（跳主界面）。
+                 * 现在：一旦屏幕坐标真的移开，就给它补一个 ACTION_CANCEL 并停止投喂。
+                 */
+                if (dragging) {
+                    handleDrag(ev);
+                    return true;
+                }
                 gd.onTouchEvent(ev);
                 switch (ev.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
                         downX = ev.getRawX(); downY = ev.getRawY();
+                        // 给 onSingleTapConfirmed/onDoubleTap 复核用（见 tapMovedAway）
+                        tapDownRawX = downX; tapDownRawY = downY;
                         // 拖动基准取**球**的坐标，不是窗口坐标 —— 气泡态下两者差着一整个气泡宽度
                         startBallX = ballX; startBallY = ballY;
                         moved = false;
+                        dragging = false;
                         pressFeedback(true);
                         return true;
                     case MotionEvent.ACTION_MOVE:
-                        int dx = (int) (ev.getRawX() - downX), dy = (int) (ev.getRawY() - downY);
-                        if (Math.abs(dx) > dp(5) || Math.abs(dy) > dp(5)) moved = true;
+                        if (!moved && movedEnough(ev.getRawX() - downX, ev.getRawY() - downY)) {
+                            moved = true;
+                            dragging = true;
+                            cancelGesture(gd, ev);   // 让 GestureDetector 彻底放弃这一次手势
+                        }
                         if (moved) {
-                            ballX = startBallX + dx;
-                            ballY = startBallY + dy;
+                            ballX = startBallX + (int) (ev.getRawX() - downX);
+                            ballY = startBallY + (int) (ev.getRawY() - downY);
                             clampToScreen();
                             // 交给 applyMode 统一算窗口矩形（带幂等短路，不会抖）
                             applyMode(mode, false);
@@ -1225,14 +1286,71 @@ public final class BallWindow {
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
                         pressFeedback(false);
+                        dragging = false;
                         return true;
                     default:
                         return true;
                 }
             }
+
+            /** 拖动已经成立时的后续事件：只负责跟着手指走。 */
+            private void handleDrag(MotionEvent ev) {
+                switch (ev.getActionMasked()) {
+                    case MotionEvent.ACTION_MOVE:
+                        ballX = startBallX + (int) (ev.getRawX() - downX);
+                        ballY = startBallY + (int) (ev.getRawY() - downY);
+                        clampToScreen();
+                        applyMode(mode, false);
+                        break;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        pressFeedback(false);
+                        dragging = false;
+                        break;
+                    default:
+                        break;
+                }
+            }
         });
         return ball;
     }
+
+    /** 手指在屏幕上真的移开了多少才算拖动（不是"窗口内坐标变了多少"）。 */
+    private boolean movedEnough(float dx, float dy) {
+        int slop = dp(6);
+        try {
+            int sys = android.view.ViewConfiguration.get(app).getScaledTouchSlop();
+            if (sys > slop) slop = sys;
+        } catch (Throwable ignore) { }
+        return Math.abs(dx) > slop || Math.abs(dy) > slop;
+    }
+
+    /** 给 GestureDetector 补一个 ACTION_CANCEL，让它放弃这次手势（不会再发单击/双击）。 */
+    private static void cancelGesture(GestureDetector gd, MotionEvent ev) {
+        try {
+            MotionEvent c = MotionEvent.obtain(ev);
+            c.setAction(MotionEvent.ACTION_CANCEL);
+            gd.onTouchEvent(c);
+            c.recycle();
+        } catch (Throwable ignore) { }
+    }
+
+    /**
+     * 这次"点击"其实是不是移动过？
+     *
+     * <p>用**屏幕坐标**（getRawX/getRawY）而不是 View 内坐标 —— 后者在窗口跟着手指移动时
+     * 几乎没有变化，正是这个坑的来源。DOWN 的屏幕坐标记在 {@link #tapDownRawX} 里。
+     */
+    private boolean tapMovedAway(MotionEvent e) {
+        if (e == null || tapDownRawX == Float.MIN_VALUE) return false;
+        float dx = e.getRawX() - tapDownRawX;
+        float dy = e.getRawY() - tapDownRawY;
+        return movedEnough(dx, dy);
+    }
+
+    /** 按下时的屏幕坐标（给 tapMovedAway 复核用）。 */
+    private float tapDownRawX = Float.MIN_VALUE;
+    private float tapDownRawY = Float.MIN_VALUE;
 
     /**
      * 按压反馈：按下去"被挤压"一点，松开弹回。

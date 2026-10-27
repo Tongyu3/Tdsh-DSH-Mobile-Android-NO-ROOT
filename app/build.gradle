@@ -30,8 +30,19 @@ android {
          * 这一支 0.4.2 是主线：插件生态、文件预览与下载、权限扩展、悬浮球改造。
          * versionCode 55 比 0.4.1(53) 高，能覆盖安装且保留数据。
          */
-        versionCode 59
-        versionName "0.4.7"
+        versionCode 64
+        versionName "0.4.9"
+        /*
+         * 只打 arm64-v8a。
+         *
+         * sherpa-onnx 的 AAR 里四个 ABI 全带（arm64 / armv7 / x86 / x86_64），
+         * 一共约 100MB 的原生库；只留 arm64 是 31MB。
+         * 这台机器（Android 16）和其他目标机型都是 arm64；真要给 32 位老机器用，
+         * 把 'armeabi-v7a' 加回来即可（+15MB）。
+         */
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
     }
 
     signingConfigs {
@@ -122,6 +133,33 @@ dependencies {
     // rootfs 是 .tar.gz，Android 没有内置 tar 解包能力。
     // 用 1.26.2：这个版本没有额外依赖（1.27+ 会强制依赖 commons-io）。
     implementation 'org.apache.commons:commons-compress:1.26.2'
+
+    /*
+     * ── 本地语音（离线 TTS 模型）────────────────────────────────────
+     *
+     * sherpa-onnx：ONNX Runtime + 一套"离线 TTS/ASR"的 JNI 封装（Apache-2.0）。
+     * 为什么要引它：手机上没有系统级的"可换模型" TTS —— 系统 TextToSpeech
+     * 只认已安装的引擎 App，改不了音色/模型。要在手机本地跑开源模型（VITS 音色、
+     * 以及 ZipVoice 那种"给一段参考人声就能克隆"的零样本模型），必须自己带推理运行时。
+     *
+     * 为什么把 aar 放进 app/libs 而不是从仓库拉：
+     *   1) 构建是 --offline（离线缓存里没有它）；
+     *   2) 它的正式分发只在 GitHub Release（本机到 release-assets 不可达，是绕代理下下来的）。
+     * 于是直接入库，构建可复现、不再依赖外网。
+     *
+     * 体积：aar 47MB（四个 ABI 的原生库），打包时用 abiFilters 只留 arm64 → 约 31MB。
+     */
+    implementation files('libs/sherpa-onnx.aar')
+
+    /*
+     * kotlin-stdlib：sherpa 的 Java 绑定是 Kotlin 写的（OfflineTtsConfig 等是 data class）。
+     * 不引它，运行到 new OfflineTtsConfig() 会 NoClassDefFoundError: DefaultConstructorMarker。
+     *
+     * 为什么是 1.8.22 而不是更新的版本：构建是 --offline，缓存里 2.1.0 只存了 stdlib 本体、
+     * 缺它 POM 上挂的 kotlin-stdlib-common（离线解析直接失败）；1.8.22 那一对是齐的。
+     * 我们只用它的 Intrinsics / DefaultConstructorMarker 这类最底层的类，版本高低没有影响。
+     */
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:1.8.22'
 
     /*
      * Shizuku：让"没有电脑"的用户也能拿到那一笔关键权限。

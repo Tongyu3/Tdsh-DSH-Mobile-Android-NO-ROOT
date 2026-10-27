@@ -1210,6 +1210,17 @@ public class MainActivity extends Activity {
         // JS 桥：让注入到 DSH 设置页里的「API Key（本机）」入口能打开本 App 的原生设置。
         // 只暴露这一个方法，且页面只可能是本机回环上的 DSH。
         webView.addJavascriptInterface(new AppBridge(), "DshAndroid");
+        /*
+         * 朗读的状态要能"推"回网页（播完 / 出错 / 被停止）。
+         * 回调里必须切主线程再 evaluateJavascript —— WebView 的调用不是线程安全的，
+         * 而云端音频的播完回调来自 MediaPlayer 所在的线程。
+         */
+        Tts.attach(json -> runOnUiThread(() -> {
+            try {
+                webView.evaluateJavascript(
+                        "window.__dshTtsEvent&&window.__dshTtsEvent(" + json + ")", null);
+            } catch (Throwable ignore) { }
+        }));
         WebSettings ws = webView.getSettings();
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
@@ -1933,7 +1944,8 @@ public class MainActivity extends Activity {
             StringBuilder sb = new StringBuilder();
             for (Changelog.Entry e : notes) {
                 if (notes.size() > 1) sb.append("v").append(e.version).append('\n');
-                for (String item : e.items) sb.append("· ").append(item).append('\n');
+                // 这个弹窗是纯文本 AlertDialog，不加粗 —— 必须把 ** 去掉，否则星号会原样露出来
+                for (String item : e.items) sb.append("· ").append(item.replace("**", "")).append('\n');
                 sb.append('\n');
             }
             sb.append(seen <= 0
@@ -5055,6 +5067,207 @@ public class MainActivity extends Activity {
                 Log.w(TAG, "copyText 失败", t);
                 return "ERROR " + t;
             }
+        }
+
+        /**
+         * 用系统浏览器打开一个外部地址。
+         *
+         * <p>为什么需要它：DSH 的**账号登录**要开一个网页完成授权
+         * （{@code window.open('about:blank')} 预开标签页、再把它导航到授权地址）。
+         * WebView 不支持多窗口，那次 window.open 会把 about:blank
+         * 直接开在**本窗口**里 —— 整个界面变成白纸（真机复现，2026-10-27）。
+         *
+         * <p>页面侧（tools/patch.js 的 patchWindowOpen）给 window.open 换成了
+         * 一个假窗口对象，导航时调到这里。登录在浏览器里完成，DSH 侧轮询到
+         * 状态变化后自己收尾，界面全程不动。
+         */
+        @android.webkit.JavascriptInterface
+        public void openUrl(final String url) {
+            if (url == null || url.isEmpty()) return;
+            final android.net.Uri uri;
+            try {
+                uri = android.net.Uri.parse(url);
+            } catch (Throwable t) {
+                return;
+            }
+            String scheme = uri.getScheme();
+            if (scheme == null) return;
+            scheme = scheme.toLowerCase();
+            // 只放行网页：别让页面里的任意字符串（intent:// / file://）借这个口子跳出沙箱
+            if (!"http".equals(scheme) && !"https".equals(scheme)) return;
+            runOnUiThread(() -> {
+                try {
+                    Intent view = new Intent(Intent.ACTION_VIEW, uri);
+                    view.addCategory(Intent.CATEGORY_BROWSABLE);
+                    startActivity(view);
+                } catch (Throwable t) {
+                    Log.w(TAG, "openUrl 没有浏览器能打开 " + uri, t);
+                    android.widget.Toast.makeText(MainActivity.this,
+                            "这台设备上没有能打开该链接的浏览器",
+                            android.widget.Toast.LENGTH_LONG).show();
+                }
+            });
+        }
+
+        /**
+         * 朗读：能力清单（有没有系统语音引擎、有哪些离线音色）。
+         *
+         * <p>网页侧（插件 dsh-tts）的设置页拿它填"音色"下拉，
+         * 顺便在没引擎时给出人话提示。第一次调用会顺带把引擎建起来，
+         * 所以刚打开设置页时 ready 可能是 false —— 网页那边会再问一次。
+         */
+        @android.webkit.JavascriptInterface
+        public String ttsInfo() {
+            try {
+                return Tts.info(MainActivity.this);
+            } catch (Throwable t) {
+                return "{\"ready\":false,\"error\":\"" + Tts.esc(String.valueOf(t)) + "\"}";
+            }
+        }
+
+        /**
+         * 用系统语音朗读（本地合成，不联网、不花钱）。
+         *
+         * @param optsJson {@code {"rate":1.0,"pitch":1.0,"voice":"…"}}
+         */
+        @android.webkit.JavascriptInterface
+        public void ttsSpeak(final String text, final String optsJson) {
+            try {
+                Tts.speak(MainActivity.this, text, optsJson);
+            } catch (Throwable t) {
+                Log.w(TAG, "ttsSpeak 失败", t);
+            }
+        }
+
+        /** 停止一切朗读（系统语音与云端音频）。 */
+        @android.webkit.JavascriptInterface
+        public void ttsStop() {
+            try {
+                Tts.stopAll();
+            } catch (Throwable ignore) { }
+        }
+
+        /**
+         * 云端 / 自定义 TTS：由原生发请求、拿音频、播放。
+         *
+         * <p>为什么不放在网页里 fetch：CORS 会把大部分第三方接口挡掉，
+         * 而且 API Key 会躺在页面里。放原生以后，任何"返回音频"的接口
+         * （OpenAI 兼容的 /audio/speech、GPT-SoVITS、RVC 那类变声服务）都能直接接。
+         *
+         * @param reqJson {@code {"url":"…","method":"POST","headers":{…},"body":"…"}}
+         */
+        @android.webkit.JavascriptInterface
+        public void ttsPlay(final String reqJson) {
+            try {
+                Tts.playHttp(MainActivity.this, reqJson);
+            } catch (Throwable t) {
+                Log.w(TAG, "ttsPlay 失败", t);
+            }
+        }
+
+        // ── 本地模型（离线 TTS 模型）─────────────────────────────────
+
+        /**
+         * 已安装的本地模型清单 + 内置模型的安装状态。
+         *
+         * @return {@code {"count":1,"models":[…],"builtin":{"id":"nahida",...}}}
+         */
+        @android.webkit.JavascriptInterface
+        public String ttsModels() {
+            try {
+                java.util.List<TtsModels.Model> all = TtsModels.list(MainActivity.this);
+                StringBuilder sb = new StringBuilder();
+                sb.append("{\"count\":").append(all.size()).append(",\"models\":[");
+                for (int i = 0; i < all.size(); i++) {
+                    if (i > 0) sb.append(',');
+                    sb.append(all.get(i).toJson());
+                }
+                sb.append("],\"builtin\":");
+                TtsModels.Model nahida = TtsModels.get(MainActivity.this, "nahida");
+                if (nahida != null) {
+                    sb.append(nahida.toJson());
+                } else {
+                    sb.append("{\"id\":\"nahida\",\"name\":\"纳西妲（克隆音色）\",\"kind\":\"zipvoice\",")
+                      .append("\"mb\":158,\"installed\":false,\"ref\":true}");
+                }
+                sb.append('}');
+                return sb.toString();
+            } catch (Throwable t) {
+                return "{\"count\":0,\"models\":[],\"error\":\"" + Tts.esc(String.valueOf(t)) + "\"}";
+            }
+        }
+
+        /**
+         * 用一个链接安装本地模型（下载 + 解包 + 登记，全在后台线程）。
+         *
+         * <p>进度通过 {@code __dshTtsEvent} 回给网页：{@code {"type":"modelProgress","pct":42,"step":"下载 12.3MB / 109MB"}}。
+         * 完成后发 {@code {"type":"modelDone","id":"…","name":"…"}}。
+         *
+         * @param builtin 传 "nahida" 表示安装内置的纳西妲音色（固定模型 + 内置参考人声）
+         */
+        @android.webkit.JavascriptInterface
+        public void ttsModelAdd(final String url, final String builtin) {
+            new Thread(() -> {
+                final String tag = builtin == null || builtin.isEmpty() ? "add" : builtin;
+                try {
+                    String u = url == null ? "" : url.trim();
+                    String ref = null;
+                    String refText = null;
+                    String id = null;
+                    String name = null;
+                    if (!"add".equals(tag)) {
+                        // 内置纳西妲：模型是 sherpa 发布的 ZipVoice int8（104MB + 54MB 声码器），
+                        // 参考人声用 assets 里那段（从纳西妲语音素材里截的 8 秒）
+                        if (u.isEmpty()) {
+                            u = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
+                                    + "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2";
+                        }
+                        java.io.File r = TtsModels.bundledReference(MainActivity.this);
+                        ref = r == null ? null : r.getAbsolutePath();
+                        /*
+                         * 参考人声的**逐字稿**。ZipVoice 是"零样本克隆"，它靠这段文字和音频对齐
+                         * 来判断该模仿什么；官方文档明确写了"两者不一致时音色会明显退化"。
+                         * 这段字是用本机 whisper-small 对这段 8 秒音频转出来的
+                         * （两遍解码结果一致），不是手写的。
+                         */
+                        refText = "也看我像个孩子，我比任何一位大人都了解这个世界。所以，我可以用我的知识。";
+                        id = "nahida";
+                        name = "纳西妲（克隆音色）";
+                    }
+                    TtsModels.Model m = TtsModels.install(MainActivity.this, u, id, name, ref, refText,
+                            (pct, step) -> pushTtsEvent("{\"type\":\"modelProgress\",\"pct\":" + pct
+                                    + ",\"step\":\"" + Tts.esc(step) + "\"}"));
+                    if (m == null) throw new IllegalStateException("装好了但读不出模型清单");
+                    pushTtsEvent("{\"type\":\"modelDone\",\"id\":\"" + Tts.esc(m.id)
+                            + "\",\"name\":\"" + Tts.esc(m.name) + "\"}");
+                } catch (Throwable t) {
+                    Log.w(TAG, "安装本地模型失败", t);
+                    pushTtsEvent("{\"type\":\"modelError\",\"message\":\"" + Tts.esc(String.valueOf(t.getMessage() == null ? t : t.getMessage())) + "\"}");
+                }
+            }, "dsh-tts-model-add").start();
+        }
+
+        /** 删除一个本地模型（腾出空间）。 */
+        @android.webkit.JavascriptInterface
+        public String ttsModelDel(final String id) {
+            try {
+                boolean ok = TtsModels.remove(MainActivity.this, id);
+                return ok ? "OK" : "没有这个模型";
+            } catch (Throwable t) {
+                return String.valueOf(t);
+            }
+        }
+
+        /** 把一行朗读事件推给网页（复用 ttsSpeak 的那条回调）。 */
+        private void pushTtsEvent(final String json) {
+            runOnUiThread(() -> {
+                try {
+                    if (webView != null) {
+                        webView.evaluateJavascript(
+                                "window.__dshTtsEvent&&window.__dshTtsEvent(" + json + ")", null);
+                    }
+                } catch (Throwable ignore) { }
+            });
         }
 
         /** 文件名安全化：挡掉路径分隔符与控制字符，超长则保留扩展名截断。 */

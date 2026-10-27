@@ -16,7 +16,20 @@
   // 否则会调用上一次注入留下的旧闭包（旧 CSS / 旧逻辑），改了却看不到效果。
   if (W.__dshMobilePatch && !W.__dshMobileForce) { W.__dshMobilePatch(); return; }
 
-  var NARROW_PX = 700;          // 窄屏阈值
+  /*
+   * 窄屏阈值（2026-10-21 从 700 提到 900，修平板"一开侧边栏聊天就被挤成一条"）。
+   *
+   * 判据不是"这是手机还是平板"，而是**放下侧边栏之后聊天还剩多少**：
+   * DSH 的侧边栏在桌面布局里是 360px 的常驻列，平板竖屏（常见 800~834 CSS px）
+   * 减掉 360 只剩 440，再加上消息区的内边距就窄得没法读 ——
+   * 用户拍的就是这个：一拉侧边栏，对话被压成一窄条。
+   *
+   * 360（侧边栏）+ 540（聊天最低可读宽度）≈ 900。
+   * 小于它的设备（手机、竖屏平板、横屏小屏）统一走"抽屉浮层"：
+   * 侧边栏变成 280px 的覆盖层盖在对话上，聊天永远满宽。
+   * 大于它的（横屏平板、大屏）才保留 DSH 自己的常驻双栏。
+   */
+  var NARROW_PX = 900;
   /*
    * 顶部布局与轮询的统一参数。
    *
@@ -297,10 +310,22 @@
      * 副作用：从侧边栏进去的设置页、以及里面注入的「API Key / 手机控制」
      * 两个入口全都被挤成一条窄栏。
      */
-    'body:not([data-dsh-rail-hidden="1"]) [class*="sidebarCol"]{',
+    /*
+     * ⚠️ 这两条**必须**限定在手机模式（data-dsh-mobile="1"）里（2026-10-21 修平板死锁）。
+     *
+     * 它们在平板上的后果是灾难性的：平板走的是 DSH 自己的常驻双栏，
+     * 侧边栏是**栅格里的一个 360px 列**。一旦我们写了 data-dsh-rail-hidden=1，
+     * 这条 transform 会把侧边栏平移到屏幕外 —— 但**栅格列还占着那 360px**，
+     * 于是聊天区继续被挤在右边一条窄缝里，而侧边栏**看不见也点不到**；
+     * 平板路径下鲸鱼按钮的点击是被忽略的，用户没有任何办法恢复。
+     *
+     * 触发它的路径还特别日常：平板的内联侧边栏里点一下某个会话，
+     * patchDrawerAutoClose 就会调 requestRail(true)（它原来是给手机写的）。
+     */
+    'html[data-dsh-mobile="1"] body:not([data-dsh-rail-hidden="1"]) [class*="sidebarCol"]{',
     '  transform:none!important;',
     '}',
-    'body[data-dsh-rail-hidden="1"] [class*="sidebarCol"]{',
+    'html[data-dsh-mobile="1"] body[data-dsh-rail-hidden="1"] [class*="sidebarCol"]{',
     '  transform:translateX(-100%)!important;box-shadow:none;',
     '}',
     /*
@@ -325,8 +350,17 @@
      * 实测会话标题按钮在 [20,11]，鲸鱼占 [8..50]，两者重叠。
      * 侧边栏隐藏时把标题行整体右移，腾出鲸鱼的位置。
      */
-    'body[data-dsh-rail-hidden="1"] [class*="titleRow"]{',
+    'html[data-dsh-mobile="1"] body[data-dsh-rail-hidden="1"] [class*="titleRow"]{',
     '  padding-left:54px!important;',
+    '}',
+    /*
+     * 非手机模式（真平板）下**不要**显示浮动鲸鱼。
+     *
+     * 平板的侧边栏是常驻的，鲸鱼按钮既不该出现，点了也不会有效果
+     * （railTapHandler 在宽屏早早 return）。留着就是一个挡视线、点了没反应的死按钮。
+     */
+    'html:not([data-dsh-mobile="1"]) #dsh-rail-btn{',
+    '  display:none!important;',
     '}',
     /*
      * （原来的 grid-template-columns / width 过渡已删除 —— 见上面抽屉那段：
@@ -939,6 +973,53 @@
   var railFlipTimer = 0;
 
   /**
+   * 抽屉动画期间的"别来抢主线程"截止时刻（毫秒时间戳）。
+   *
+   * <h3>为什么需要（用户报：大对话时拉抽屉卡死/闪退）</h3>
+   * 抽屉是纯 transform 的合成层动画 —— 本身几乎不花主线程。
+   * 真正抢主线程的是**我们自己的重排工作**：`MutationObserver(整页)` →
+   * `scheduleApply` → `apply()` 里那一串 patch 函数。
+   * 平时这没事（150ms 去抖），但拉抽屉时 DSH 会同步重渲染侧边栏内容，
+   * 一次会话很多、或者当前会话很长时，这些变更会连着触发 apply()，
+   * 正好压在动画帧上 → 掉帧成幻灯片；主线程被占满时用户就"拉不出来"。
+   *
+   * <p>所以：动画窗口内**不跑 apply**，等落定再补一次。补的那一次一定跑，
+   * 只是晚 300ms 左右 —— 那 300ms 里界面本来就在动，用户看不出差别。
+   */
+  var railSettleAt = 0;
+
+  /** 抽屉动画结束后多久才允许 apply 补跑（毫秒）。 */
+  var RAIL_SETTLE_PAD_MS = 340;
+
+  /**
+   * 抽屉滑动的**帧率体检**（诊断用，只在内存里，界面零开销）。
+   *
+   * <p>为什么要量：这台机器上复现不了"大对话 + 拉抽屉卡死"（没有那么大的一轮对话），
+   * 只能把尺子放进代码里 —— 用户下次说卡，读一次 `__dshRailPerf` 就知道
+   * 是掉帧（worstFrameMs 大）还是根本没开始动（frames 很少）。
+   *
+   * @param ms 预计动画时长
+   */
+  function railPerfStart(ms) {
+    try {
+      var t0 = (window.performance || Date).now();
+      var last = t0, frames = 0, worst = 0;
+      var end = t0 + ms + 120;
+      (function loop() {
+        var now = (window.performance || Date).now();
+        if (frames > 0) {
+          var d = now - last;
+          if (d > worst) worst = d;
+        }
+        last = now;
+        frames++;
+        if (now < end) requestAnimationFrame(loop);
+        else W.__dshRailPerf = { ms: Math.round(now - t0), frames: frames, worstFrameMs: Math.round(worst) };
+      })();
+    } catch (e) { }
+  }
+
+  /**
    * 请求抽屉的开/合状态。
    *
    * <h3>★ 第四轮（这一版）：不再自己改属性，改成"点 DSH 的按钮"</h3>
@@ -966,6 +1047,18 @@
    * @param fromUser 是否用户直接发起（用户发起时优先，不被自动同步压回）
    */
   function requestRail(hidden, fromUser) {
+    /*
+     * ★ 宽屏（真平板）**一律不接管**（2026-10-21）。
+     *
+     * 原因见上面那两条被限定在 data-dsh-mobile="1" 的 transform 规则：
+     * 平板的侧边栏是栅格里的常驻列，我们这套"抽屉=位移"的状态机在那边没有任何意义，
+     * 一旦被写进 data-dsh-rail-hidden，就会把内联侧边栏推出屏幕而列宽照样占着，
+     * 聊天区被挤成窄缝、侧边栏还调不回来 —— 用户在平板上点一下会话就可能中招。
+     */
+    if (typeof window !== 'undefined' && window.innerWidth >= NARROW_PX) {
+      W.__dshRailSkippedWide = (W.__dshRailSkippedWide || 0) + 1;
+      return false;
+    }
     /*
      * 第七轮起**不再需要任何闩锁**：状态只有 DSH 一个来源，
      * 我们不再"压住"任何东西，也就没有需要防的中间态误判。
@@ -1086,6 +1179,8 @@
     if (hidden) {
       // ① 唯一真相：先写属性 → 这一帧就开始滑
       document.body.setAttribute('data-dsh-rail-hidden', '1');
+      railSettleAt = Date.now() + RAIL_FLIP_CLOSE_MS + RAIL_SETTLE_PAD_MS;
+      railPerfStart(RAIL_FLIP_CLOSE_MS);
       railDiag('requestRail(hide) → 已写属性，开始滑动；DSH 同步延后 '
                + RAIL_FLIP_CLOSE_MS + 'ms');
       railFlipTimer = setTimeout(function () {
@@ -1100,6 +1195,8 @@
      */
     document.body.setAttribute('data-dsh-rail-hidden', '1');
     syncDshCollapsedNow(false);
+    railSettleAt = Date.now() + RAIL_FLIP_OPEN_MS + 260 + RAIL_SETTLE_PAD_MS;
+    railPerfStart(RAIL_FLIP_OPEN_MS + 260);
     railDiag('requestRail(show) → 先在屏幕外展开内容，' + RAIL_FLIP_OPEN_MS + 'ms 后滑入');
     railFlipTimer = setTimeout(function () {
       railFlipTimer = 0;
@@ -1219,6 +1316,13 @@
     document.addEventListener('click', function (ev) {
       // 我们自己派发的那一击（requestRail 去点 DSH 按钮）—— 不算用户操作
       if (railDelegating) return;
+      /*
+       * 「选完就收」是**手机抽屉**才需要的（抽屉会盖住对话，不收就回不去）。
+       * 平板的侧边栏是常驻的，DSH 自己就是"点了会话侧边栏还在"，
+       * 这里必须放过去 —— 否则 collapseRail() 会在平板上去动抽屉状态，
+       * 把内联侧边栏推出屏幕（2026-10-21 修）。
+       */
+      if (window.innerWidth >= NARROW_PX) return;
       var t = ev.target;
       if (!t || !t.closest) return;
       /*
@@ -2055,7 +2159,15 @@
   function scheduleApply() {
     if (pending) return;
     pending = true;
-    setTimeout(function () { pending = false; apply(); }, 150);
+    /*
+     * 抽屉正在滑：这一下别抢主线程（见 railSettleAt 的注释）。
+     * 只是把这次 apply **推迟到动画结束之后**，不是丢掉 —— 用 max 保证
+     * 最后一次变更对应的那次 apply 一定会跑到。
+     */
+    var wait = 150;
+    var now = Date.now();
+    if (railSettleAt > now) wait = railSettleAt - now + 20;
+    setTimeout(function () { pending = false; apply(); }, wait);
   }
 
   /*
@@ -2508,6 +2620,17 @@ function patchDownloads() {
     ensureStyle();
     var narrow = window.innerWidth < NARROW_PX;
     root.setAttribute('data-dsh-mobile', narrow ? '1' : '0');
+    /*
+     * 宽屏上把手机那套抽屉状态**清干净**（2026-10-21）。
+     *
+     * 老版本在平板里点过会话之后会把 data-dsh-rail-hidden 写成 1，而那条 transform
+     * 不加限定、会把内联侧边栏推出屏幕 —— 之后界面就卡在"聊天挤成窄缝、侧边栏没了"
+     * 的样子（重开 App 才会好）。这里的清理让受影响的人**刷新一次就恢复**，
+     * 也让"从手机模式切到平板宽度"这种旋转场景不会残留状态。
+     */
+    if (!narrow && document.body && document.body.hasAttribute('data-dsh-rail-hidden')) {
+      document.body.removeAttribute('data-dsh-rail-hidden');
+    }
 
     /*
      * 与宽度无关的修补 —— 平板（>= 700px）同样要生效。
@@ -2534,6 +2657,11 @@ function patchDownloads() {
      */
     patchDownloads();
     patchClipboard();
+    /*
+     * 账号登录用的 window.open 守卫 —— 必须无条件装（平板/手机都会点到「登录」）。
+     * 装晚了也没关系：DSH 是在点击那一刻才调 window.open，不是加载时缓存的。
+     */
+    patchWindowOpen();
     /*
      * 主题上报 —— 用户要求原生页"跟随 DSH"而不是跟随系统。
      *
@@ -2646,7 +2774,18 @@ function patchDownloads() {
      * 本来就该常驻可见，否则用户连"怎么换会话"都找不到。
      * 函数内部自己按宽度判断，窄屏会直接退出（手机上抽屉该是收起的）。
      */
-    patchSidebarExpanded();
+    /*
+     * 平板：**不再插手 DSH 自己的侧边栏状态**（2026-10-21 用户要求）。
+     *
+     * 这里原来调用 patchSidebarExpanded() —— 它会在侧边栏处于"只剩图标轨道"时
+     * 去点 DSH 那个 0×0 的「打开侧边栏」按钮（最多点 3 次），硬把它展开。
+     * 用户的反馈是"平板上侧边栏两侧的按钮延迟特别高"：我们这一次**替代点击**
+     * 和用户自己的点击撞在一起，本质上就是"点了它还要等我们补一下"，手感很差。
+     *
+     * 平板的大屏布局本来就是 DSH 的原生行为，用户明确说"尽量让平板用原生 UI" ——
+     * 所以这一步整个去掉，改成完全不干预：DSH 记住什么状态就是什么状态。
+     * 手机侧不受影响（手机走下面的抽屉逻辑，不看这个函数）。
+     */
 
     /*
      * 本机入口（「API Key」/「手机权限」）必须**与屏幕宽度无关**。
@@ -3083,11 +3222,29 @@ function patchDownloads() {
    * 但 Android 上"聚焦可编辑元素"= 系统弹输入法 —— 用户只是翻了一下会话列表，
    * 键盘就自己顶上来，把半屏内容挤走。
    *
-   * <h3>怎么拦才不误伤</h3>
-   * 判据是"这次聚焦**有没有手指参与**"：
-   *   · 最近 1.2 秒内有过 pointerdown / touchstart / keydown / input → 放行
-   *     （用户刚点过输入框、或者正在打字，此时任何聚焦都不该被打断）；
-   *   · 否则（纯脚本调用的 focus）→ 立刻 blur，键盘不弹。
+   * <h3>第一版错在哪（GitHub issue：键盘一弹就收 / 输入区点不动 / 删除位置错）</h3>
+   * 第一版的判据是"最近 1500ms 内有没有手指落在**输入区**上"，不满足就同步 blur()。
+   * 于是只要这次聚焦不是"手指正好落在输入框元素上"这一个特例，就会被自己人打回去：
+   *   · 点在输入框外面的容器 / 占位区 / 整行 / 图标上（那些节点不在 isComposerNode 的判据里）；
+   *   · 输入框由脚本 focus()（插附件、插路径、面板里的按钮）；
+   *   · 软键盘打字时 WebView 不一定派发 keydown，时间窗早就过期了。
+   * 而 blur() 是**同步**的：WebView 刚请求弹键盘，紧接着自己把焦点撤了 ——
+   * 系统侧看到的就是 onRequestShow → onCancelled(PHASE_CLIENT_APPLY_ANIMATION)。
+   * 更糟的是 Lexical 的 $getDOMSelection() 因此读不到可用的 DOM selection，
+   * 它内存里的 selection 停在 offset 0，之后"光标在中间、删除却从开头删"、
+   * "粘贴完光标退回粘贴词前面"都是这一个根因的下游。
+   *
+   * <h3>现在怎么判（只在"确实是脚本偷偷抢焦点"时才拦）</h3>
+   * 按顺序，任一条命中就**放行**：
+   *   ① 键盘已经弹着（innerHeight - visualViewport.height &gt; 120）—— 本来就不会再弹；
+   *   ② 输入法组词中（compositionstart…compositionend）—— 拦了就会丢字；
+   *   ③ 目标是面板 / 弹窗 / 提问卡里的输入框 —— 那本来就该弹；
+   *   ④ 我们自己开的窗口（__dshAllowEditorFocus）；
+   *   ⑤ 最近 1.2 秒在打字，或最近 900ms 有真实手势（任意位置的 pointerdown/touchstart）。
+   * 只有下面两种才撤销（都正好对应"用户没想弹键盘"）：
+   *   ⑥ 点的是导航（会话行 / 侧边栏 / 新建会话）之后 1.6 秒内的聚焦 ——
+   *      那正是"翻了一下会话列表，键盘自己顶上来"；
+   *   ⑦ 完全没有手指参与的纯脚本聚焦。
    *
    * <p>`__dshAllowEditorFocus(ms)` 给自己人留一个明口：插附件/插路径这类
    * **我们主动调 focus** 的场景，先开个窗口再调，免得被自己的守卫打回去。
@@ -3095,64 +3252,92 @@ function patchDownloads() {
   (function imeFocusGuard() {
     if (W.__dshImeGuard) return;
     W.__dshImeGuard = true;
-    var lastEditableAt = 0;   // 最后一次"手指落在输入框/输入区"的时刻
-    var allowUntil = 0;
+    var lastGestureAt = 0;    // 最后一次真实手指动作（任意位置）
+    var typingAt = 0;         // 最后一次打字（软键盘不一定派发 keydown，所以也认 input）
+    var navAt = 0;            // 最后一次"导航类"点击（会话行 / 侧边栏 / 悬浮鲸鱼键）
+    var allowUntil = 0;       // 我们自己开的窗口（__dshAllowEditorFocus）
+    var composing = false;    // 输入法正在组词
+    var kicks = 0;            // 我们撤销过多少次（诊断用：W.__dshFocusKicks()）
 
-    /** 这个节点是不是属于输入区（输入框本身，或者它周围那一条工具栏）。 */
-    function isComposerNode(node) {
+    /** 这个节点是不是在侧边栏 / 会话列表里（点它属于"导航"，不该顺带弹键盘）。 */
+    function isNavNode(node) {
       try {
         var el = node && (node.nodeType === 1 ? node : node.parentElement);
         if (!el || !el.closest) return false;
-        return !!el.closest('input,textarea,[contenteditable="true"],[class*="composer"]');
+        return !!el.closest('[class*="sidebar" i],[role="treeitem"],[data-slot*="sidebar" i],'
+            + '[class*="sessionList" i],[class*="logoRow"],#dsh-rail-btn');
       } catch (e) { return false; }
     }
 
-    /*
-     * ★ 只把"落在输入区上的手势"算作许可（2026-10-21 实测修正）。
-     *
-     * 第一版是"任何位置有手势都放行 1.2 秒"，结果实测**完全没用**：
-     * 用户点的是抽屉里的会话行，那次触摸本身就是手势，DSH 紧接着调 focus() ——
-     * 落在同一个 1.2 秒窗口里，于是被放行、键盘照样弹（真机复现：
-     * 点会话行 → activeElement 变成 DIV(editable)、mInputShown=true）。
-     *
-     * 现在只认**输入区里的手势**：点会话行不算许可 → 后续的脚本聚焦被吐掉。
-     * 而点输入框、点输入框上那条工具栏（附件/表情）仍然放行，
-     * 那些场景键盘本来就该弹。
-     */
+    /** 面板 / 弹窗 / 提问卡 / 菜单里的输入框 —— 那里的弹键盘是正常的。 */
+    function inFloating(node) {
+      try {
+        var el = node && (node.nodeType === 1 ? node : node.parentElement);
+        if (!el || !el.closest) return false;
+        return !!el.closest('[role="dialog"],[role="alertdialog"],[role="menu"],'
+            + '[aria-modal="true"],[data-plugin-panel],[data-sidebar-right-panel],'
+            + '[class*="popover" i],[class*="modal" i],[class*="panel" i],[class*="dialog" i]');
+      } catch (e) { return false; }
+    }
+
+    /** 软键盘是否已经弹出来（看可视视口被顶掉多少，不依赖 DSH 的任何内部状态）。 */
+    function keyboardVisible() {
+      try {
+        var vv = W.visualViewport;
+        if (!vv) return false;
+        return (W.innerHeight - vv.height) > 120;
+      } catch (e) { return false; }
+    }
+
     function markGesture(ev) {
       try {
-        if (ev && (ev.type === 'keydown' || ev.type === 'input')) {
-          lastEditableAt = Date.now();     // 打字只可能发生在输入区
-          return;
-        }
-        if (isComposerNode(ev && ev.target)) lastEditableAt = Date.now();
+        var now = Date.now();
+        if (ev && (ev.type === 'keydown' || ev.type === 'input')) { typingAt = now; return; }
+        lastGestureAt = now;
+        if (isNavNode(ev && ev.target)) navAt = now;
       } catch (e) { }
     }
     ['pointerdown', 'touchstart', 'mousedown', 'keydown', 'input'].forEach(function (t) {
       try { document.addEventListener(t, markGesture, true); } catch (e) { }
     });
+    /*
+     * 组词期间那一下失焦，输入法会把正在拼的字整段丢掉 —— 用户看到的是"打着打着没了"。
+     * 这两个事件在 document 上冒泡，捕获阶段接住最稳。
+     */
+    try { document.addEventListener('compositionstart', function () { composing = true; }, true); } catch (e) { }
+    try { document.addEventListener('compositionend', function () { composing = false; }, true); } catch (e) { }
 
     /** 给自家代码开一个"允许聚焦"的窗口（毫秒）。 */
     W.__dshAllowEditorFocus = function (ms) {
       allowUntil = Date.now() + (ms || 2000);
     };
 
+    /** 诊断：被撤销了多少次、最后一次是因为什么。 */
+    W.__dshFocusKicks = function () { return kicks; };
+
+    /** 撤销一次聚焦（唯一真正会动焦点的地方）。 */
+    function kick(el, now, why) {
+      try {
+        el.blur();
+        kicks++;
+        W.__dshLastFocusKickAt = now;
+        W.__dshLastFocusKickWhy = why;
+      } catch (e) { }
+    }
+
     try {
       document.addEventListener('focusin', function (ev) {
         var el = ev.target;
         if (!el || !el.isContentEditable) return;
         var now = Date.now();
-        if (now - lastEditableAt < 1500) return;  // 用户刚点过输入区 → 这是他自己要的
-        if (now < allowUntil) return;             // 我们自己开的窗口
-        /*
-         * 脚本发起的聚焦 → 立刻吐出来。
-         * 用 blur() 而不是 preventDefault：focusin 已经在聚焦之后了，
-         * 只能"撤销"；blur 之后输入框依然可用，用户点一下就会再聚焦。
-         */
-        try {
-          el.blur();
-          W.__dshLastFocusKickAt = now;
-        } catch (e) { }
+        if (keyboardVisible()) return;                 // ① 键盘已经弹着，拦它只会丢字
+        if (composing) return;                         // ② 组词中
+        if (inFloating(el)) return;                    // ③ 弹窗 / 面板 / 提问卡
+        if (now < allowUntil) return;                  // ④ 我们自己开的窗口
+        if (now - typingAt < 1200) return;             // ⑤ 正在打字
+        if (now - navAt < 1600) { kick(el, now, 'nav'); return; }      // ⑥ 翻会话后的脚本聚焦
+        if (now - lastGestureAt < 900) return;         // ⑤ 刚有真实手势 —— 用户要的
+        kick(el, now, 'script');                       // ⑦ 纯脚本聚焦（挂载/发完消息）
       }, true);
     } catch (e) { }
   })();
@@ -3281,6 +3466,71 @@ function patchDownloads() {
       return false;
     }
   };
+
+  /*
+   * 【账号登录白屏】—— DSH 0.2.1 的登录会先 window.open('about:blank','_blank')
+   * 预开一个标签页，拿到授权地址后再 popup.location.replace(url)。
+   *
+   * WebView 不支持多窗口：window.open 会把 about:blank **在同一个窗口里**打开，
+   * 于是整个 DSH 界面当场换成一张白纸（2026-10-27 真机复现：点「登录」后
+   * location.href = about:blank、body 文本长度 0，只能杀后台）。
+   *
+   * 处理：拦下 window.open，先给一个"假窗口"对象 —— replace / assign / href
+   * 都转成**用系统浏览器打开**。登录在浏览器里完成，DSH 那边本来就在轮询状态，
+   * 登录成功后它自己会把状态翻过来、并把假窗口 close 掉。
+   * 界面原地不动，也不需要为了一个弹窗再养第二个 WebView。
+   */
+  function patchWindowOpen() {
+    if (W.__dshOpenGuard) return;
+    W.__dshOpenGuard = true;
+    var rawOpen = W.open;
+    var LOCAL = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i;
+
+    /** 把外部地址交给系统浏览器（本机地址不走这里，那是 DSH 自己的页面）。 */
+    function outside(u) {
+      u = String(u == null ? '' : u);
+      if (!/^https?:/i.test(u)) return;
+      try {
+        if (W.DshAndroid && W.DshAndroid.openUrl) { W.DshAndroid.openUrl(u); return; }
+      } catch (e) { /* 桥不可用就退回下面的导航拦截 */ }
+      try { W.location.href = u; } catch (e2) { }
+    }
+
+    /** 冒充 window.open 的返回值：只要能被安全地"导航"和"关闭"就够了。 */
+    function fakeWindow() {
+      var closed = false;
+      var loc = {
+        get href() { return 'about:blank'; },
+        set href(u) { if (!closed) outside(u); },
+        assign: function (u) { if (!closed) outside(u); },
+        replace: function (u) { if (!closed) outside(u); },
+        reload: function () { }
+      };
+      var fw = {
+        closed: false, opener: null, name: '', document: null, location: loc,
+        focus: function () { }, blur: function () { }, postMessage: function () { },
+        close: function () { closed = true; fw.closed = true; }
+      };
+      try {
+        Object.defineProperty(fw, 'location', {
+          configurable: true,
+          get: function () { return closed ? null : loc; },
+          set: function (u) { if (!closed) outside(u); }
+        });
+      } catch (e) { /* 退化成普通属性也够用 */ }
+      return fw;
+    }
+
+    W.open = function (url, name, features) {
+      var u = (url === undefined || url === null) ? '' : String(url);
+      // 空 / about:blank = "先开个空白页，等会儿再导航"，绝不能让它落到本窗口
+      if (!u || /^about:blank/i.test(u)) return fakeWindow();
+      // 外部地址（平台登录页、意见反馈表单）：系统浏览器打开，界面留在原地
+      if (/^https?:/i.test(u) && !LOCAL.test(u)) { outside(u); return fakeWindow(); }
+      // 其它（DSH 自己的地址、blob:、data:）保持原样
+      return rawOpen ? rawOpen.call(W, url, name, features) : null;
+    };
+  }
 
   /*
    * 【退格键删附件】

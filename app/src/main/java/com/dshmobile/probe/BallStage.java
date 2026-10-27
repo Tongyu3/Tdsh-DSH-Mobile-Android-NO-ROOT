@@ -165,42 +165,161 @@ public final class BallStage {
     public static int detect(String lastLine, long lineAgeMs, boolean taskActive,
                              boolean justFinished, String serviceState,
                              int webStage, long webAgeMs) {
-        /*
-         * ⓪ 网页报的阶段优先。
-         *
-         * 只认"还新鲜"的：网页停止上报（用户切走了、页面崩了）之后必须退回本地判据，
-         * 否则球会永远停在最后一个网页阶段上 —— 那和"永远空闲"是同一类 bug。
-         */
-        if (webStage >= IDLE && webStage <= ERROR && webAgeMs <= WEB_TTL_MS) return webStage;
+        return detect(lastLine, lineAgeMs, taskActive, justFinished, serviceState,
+                webStage, webAgeMs, false, null, System.currentTimeMillis());
+    }
 
-        String line = lastLine == null ? "" : lastLine.toLowerCase();
+    /**
+     * 「气泡空转」的粘性窗口：网页刚给过终态（已完成）之后，多久之内的
+     * "只有 CPU 在动"不算数（毫秒）。
+     *
+     * <h3>为什么需要（GitHub issue：气泡每 2–4 秒循环一次，34 分钟不停）</h3>
+     * 现场日志把因果写得很清楚：
+     * <pre>
+     *   15:03:13  IDLE → THINKING   网页=THINKING@381ms    有任务=true
+     *   15:03:17  THINKING → DONE   网页=DONE@2373ms       有任务=false
+     *   15:03:21  DONE → IDLE       网页=DONE@6387ms       有任务=false
+     *   15:03:27  IDLE → THINKING   网页=DONE@12393ms      有任务=true   ← 网页仍是 DONE！
+     * </pre>
+     * 交叉统计 248 次切换：<b>网页=DONE 却有任务=true 出现了 69 次，全被判成 THINKING</b>。
+     * 也就是说"有任务"这一路（容器 CPU 采样）的优先级压过了网页的终态，
+     * 而它本身是个会自己抖的标志（容器里的 node 闲着也在轮询/GC，偶尔连烧两拍），
+     * 于是终态被反复拉回"思考中"，再由"上一拍在跑、这一拍停了"判回"已完成"，永不收敛。
+     *
+     * <p>治法是"终态优先 + 要求新的可观测进展"：网页说过 DONE 之后，只有
+     * <b>新的 stdout 输出</b>、或<b>网页重新报了一个进行中的阶段</b>、或<b>网页自己说在忙</b>，
+     * 才有资格把阶段拉出 DONE/IDLE；纯 CPU 抖动一律不理。
+     * 30 秒是有意的上限：真有新任务却看不见（网页那一路坏了）时，
+     * 最多 30 秒后仍会回到"思考中"，不会重演 0.4.6 的"永远停在空闲"。
+     */
+    public static final long POST_DONE_HOLD_MS = 30_000L;
+
+    /**
+     * "已完成"这一屏至少站多久（毫秒）。
+     *
+     * <p>老实现里 DONE 只活一拍（1.5–4 秒）就被 IDLE 顶掉，用户经常根本没看见；
+     * 而"已完成"本身是有信息量的（回答完了）。站 6 秒再回空闲，
+     * 不会挡住后续阶段 —— 真有新动静会立刻按上面的规则切走。
+     */
+    public static final long DONE_SHOW_MS = 6_000L;
+
+    /**
+     * 判定用的**记忆**：把"网页最近说过什么"和"上一次已完成时的 stdout 长什么样"留住。
+     *
+     * <p>做成外部传入的可变对象（而不是 BallStage 的静态字段），
+     * 是因为它是**每个悬浮球会话各自的状态**：自检要能并发跑多组用例，
+     * 静态字段会互相污染。调用方（{@code DshService.ballLoop}）持有一个实例即可。
+     */
+    public static final class Memo {
+        /** 网页最近一次报的阶段（{@code < 0} = 没报过）。 */
+        public int webStage = -1;
+        /** 网页最近一次上报的时刻。 */
+        public long webAt = 0L;
+        /** 上一次判为"已完成"的时刻（0 = 还没有过）。 */
+        public long doneAt = 0L;
+        /** 上一次判为"已完成"时的 stdout 最后一行 —— 用来判断"之后有没有新进展"。 */
+        public String lineAtDone = null;
+
+        public void clear() {
+            webStage = -1;
+            webAt = 0L;
+            doneAt = 0L;
+            lineAtDone = null;
+        }
+    }
+
+    /**
+     * 判定当前阶段（**带记忆的完整版** —— 悬浮球真正在用的那个）。
+     *
+     * @param pageBusy 网页自己说"我在忙"（DOM 在动）。它比 CPU 采样可信得多：
+     *                 CPU 抖动不代表有任务，网页在动一定是真有活儿。
+     * @param memo     跨拍记忆，可为 null（null 时行为与老版本一致）
+     * @param now      当前时刻（毫秒）
+     */
+    public static int detect(String lastLine, long lineAgeMs, boolean taskActive,
+                             boolean justFinished, String serviceState,
+                             int webStage, long webAgeMs, boolean pageBusy,
+                             Memo memo, long now) {
+        String raw = lastLine == null ? "" : lastLine.trim();
+        boolean webFresh = webStage >= IDLE && webStage <= ERROR && webAgeMs <= WEB_TTL_MS;
+
+        /*
+         * ① 记忆维护放在判定之前：这一拍网页说了什么，下面几拍都要用。
+         *    DONE 记下"此刻的 stdout"，用来回答"完成之后到底有没有新进展"。
+         */
+        if (memo != null && webFresh) {
+            memo.webStage = webStage;
+            memo.webAt = now;
+            if (webStage == DONE) {
+                memo.doneAt = now;
+                memo.lineAtDone = raw;
+            } else if (webStage != IDLE) {
+                memo.doneAt = 0L;          // 网页重新说"在忙" → 上一次的终态作废
+            }
+        }
+
+        /* ② 网页还新鲜 → 直接采信（最准的一路，不做任何本地推断） */
+        if (webFresh) return webStage;
+
+        String line = raw.toLowerCase();
         String state = serviceState == null ? "" : serviceState;
         // 陈年输出不算数：否则阶段会被一行启动日志钉死
         if (lineAgeMs > LINE_TTL_MS) line = "";
 
-        // ① 错误优先：只要最近输出里有失败迹象，立刻报错
+        // ③ 错误优先：只要最近输出里有失败迹象，立刻报错
         if (matchesAny(line, KEYWORDS, "ERROR")) return ERROR;
 
-        // ② 初始化阶段：服务状态里明确在解压/准备
+        // ④ 初始化阶段：服务状态里明确在解压/准备
         if (containsAny(state, "解压", "初始化", "准备", "挂载", "下载", "启动中", "安装")) {
             return BOOT;
         }
         if (matchesAny(line, KEYWORDS, "BOOT")) return BOOT;
 
-        // ③ 编译 / 干活
+        // ⑤ 编译 / 干活
         if (matchesAny(line, KEYWORDS, "COMPILING")) return COMPILING;
         if (matchesAny(line, KEYWORDS, "WORKING")) return WORKING;
 
-        // ④ 收尾：明确写了完成
-        if (matchesAny(line, KEYWORDS, "DONE")) return taskActive ? WORKING : DONE;
+        // ⑥ 收尾：明确写了完成
+        if (matchesAny(line, KEYWORDS, "DONE")) {
+            if (!taskActive) {
+                markDone(memo, raw, now);
+                return DONE;
+            }
+            return WORKING;
+        }
 
-        // ⑤ 任务刚结束（没有"完成"字样，但 CPU 落下来了）
-        if (justFinished) return DONE;
+        // ⑦ 任务刚结束（没有"完成"字样，但 CPU 落下来了）
+        if (justFinished) {
+            markDone(memo, raw, now);
+            return DONE;
+        }
 
-        // ⑥ 有任务在跑但输出不可归类 —— 模型正在生成 token，就是"思考中"
-        if (taskActive) return THINKING;
+        /*
+         * ⑧ ★ 终态闸门：刚给过"已完成"，而 stdout 一个字都没再冒、网页也没说自己在忙
+         *    → 这一拍的"有任务"只可能是容器 CPU 的抖动，不许把阶段拉回"思考中"。
+         *    （这就是那个 2–4 秒空转的根因，见 POST_DONE_HOLD_MS 的注释。）
+         */
+        boolean quietSinceDone = memo != null && memo.doneAt > 0L
+                && (now - memo.doneAt) <= POST_DONE_HOLD_MS
+                && raw.equals(memo.lineAtDone == null ? "" : memo.lineAtDone);
+        boolean withinDoneShow = memo != null && memo.doneAt > 0L
+                && (now - memo.doneAt) <= DONE_SHOW_MS;
 
+        // ⑨ 有任务在跑但输出不可归类 —— 模型正在生成 token，就是"思考中"
+        if (taskActive) {
+            if (!pageBusy && quietSinceDone) return withinDoneShow ? DONE : IDLE;
+            return THINKING;
+        }
+
+        if (quietSinceDone && withinDoneShow) return DONE;   // 让"已完成"多站几秒
         return IDLE;
+    }
+
+    /** 记下"此刻已完成"，供后续几拍判断有没有新进展。 */
+    private static void markDone(Memo memo, String raw, long now) {
+        if (memo == null) return;
+        memo.doneAt = now;
+        memo.lineAtDone = raw;
     }
 
     /** 这一行是否命中某阶段的关键词。 */

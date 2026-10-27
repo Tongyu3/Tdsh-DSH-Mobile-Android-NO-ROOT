@@ -148,6 +148,68 @@ public final class Priv {
         return list + ":" + me;
     }
 
+    /** 从名单里摘掉自己（别人一律不动）；不在名单里就原样返回。 */
+    static String removeComponent(String list, String me) {
+        if (list == null || list.trim().isEmpty()) return "";
+        int slash = me.indexOf('/');
+        String pkg = me.substring(0, slash);
+        String cls = me.substring(slash + 1);
+        String shortForm = pkg + "/." + cls.substring(cls.lastIndexOf('.') + 1);
+        StringBuilder sb = new StringBuilder();
+        for (String part : list.split(":")) {
+            part = part.trim();
+            if (part.isEmpty()) continue;
+            if (part.equalsIgnoreCase(me) || part.equalsIgnoreCase(shortForm)) continue;
+            if (sb.length() > 0) sb.append(':');
+            sb.append(part);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 让系统**重新绑定**我们的无障碍服务。
+     *
+     * <h3>什么时候需要（用户报的"显示正常运行，但拦截其实掉了，而且不会自动修"）</h3>
+     * 厂商拆权限有两种手法，我们原来只防了第一种：
+     * <ol>
+     *   <li><b>改设置</b>：把 {@code enabled_accessibility_services} 里的我们删掉、
+     *       或者把 {@code accessibility_enabled} 置 0 —— 这个 {@link #needsHeal} 能看出来，
+     *       {@link #heal} 能写回去；</li>
+     *   <li><b>只拆绑定</b>：设置一个字都没动（界面看着"开着"），但系统把服务解绑了。
+     *       这时 {@code needsHeal} 返回 false，守护以为一切正常 —— 于是**永远不会修**，
+     *       而界面上那行状态也还是"已开启"（它就是读设置的）。</li>
+     * </ol>
+     * 第二种只能靠"再写一遍设置"把系统逼着重绑：先把自己从名单里摘掉（系统会解绑），
+     * 再挂回去（系统重新绑定）。这也是系统设置里"关一次再开一次"同款效果。
+     *
+     * <p>⚠️ 两次写之间必须留时间：系统是按 ContentObserver **异步**处理的，
+     * 同一个 tick 里写两次会被合并成"最终值没变" → 绑定根本不会重建。实测 260ms 够。
+     *
+     * @return 写入动作是否成功（不代表系统已经绑上）
+     */
+    public static boolean rebind(Context c) {
+        if (!canHeal(c)) return false;
+        try {
+            String me = a11yComponent(c);
+            String cur = Settings.Secure.getString(c.getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+            String without = removeComponent(cur, me);
+            Settings.Secure.putString(c.getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, without);
+            try { Thread.sleep(260L); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            Settings.Secure.putString(c.getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, merge(without, me));
+            if (!masterOn(c)) {
+                Settings.Secure.putInt(c.getContentResolver(),
+                        Settings.Secure.ACCESSIBILITY_ENABLED, 1);
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     // ── 守护开关 ────────────────────────────────────────────
 
     private static SharedPreferences prefs(Context c) {

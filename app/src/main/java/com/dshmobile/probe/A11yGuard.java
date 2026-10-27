@@ -45,6 +45,21 @@ public final class A11yGuard {
     private static volatile long sRecentSince = 0L;
     /** 已经就"频率偏高"提示过几次（避免刷屏）。 */
     private static volatile boolean sWarnedBurst = false;
+    /** 从什么时候开始"设置是开的、服务却没绑上"（0 = 现在没这个问题）。 */
+    private static volatile long sUnboundSince = 0L;
+    /** 上一次"重挂"是什么时候（冷却用，别每 3 秒都折腾系统）。 */
+    private static volatile long sLastRebindAt = 0L;
+
+    /**
+     * "设置里开着、服务却没绑上"持续多久才动手重挂（毫秒）。
+     *
+     * <p>不能一发现就重挂：刚开机 / 刚重启进程时，系统要过一两秒才绑上来，
+     * 这时候动手只会把一次正常的绑定打断。15 秒 ≈ 五次轮询，稳稳排除了"正在绑定中"。
+     */
+    private static final long UNBOUND_STALE_MS = 15_000L;
+
+    /** 两次重挂之间至少隔多久（系统重绑本身要时间，太密只会互相打架）。 */
+    private static final long REBIND_COOLDOWN_MS = 30_000L;
 
     /*
      * 计数要**跨进程重启保留**：用户真正关心的是"这一周它替我挡了多少次"，
@@ -138,6 +153,7 @@ public final class A11yGuard {
     public static void check(Context app) {
         if (!Priv.guardEnabled(app)) {
             sLastNote = "守护已关闭";
+            sUnboundSince = 0L;
             return;
         }
         // 自愈能力本身靠"无障碍服务在跑"来判断没有意义 —— 它正是被关掉的那一方。
@@ -148,12 +164,47 @@ public final class A11yGuard {
                     : "无障碍正常（无自愈权限，只能靠系统）";
             return;
         }
+
+        /*
+         * ★ 先处理"设置里开着、服务却没绑上"（2026-10-27，用户报的那一条）。
+         *
+         * 原来这里只要 needsHeal()==false 就直接 return"无障碍正常"，
+         * 而 needsHeal() 只看设置里的两个值 —— 厂商把**绑定**悄悄拆掉、设置一个字不改时，
+         * 守护会认为一切正常，于是一辈子不修；界面上那行状态也是读设置的，照样显示"已开启"。
+         * 用户看到的就是："显示正在正常运行，但权限其实掉了，而且不会自动修。"
+         */
         if (!Priv.needsHeal(app)) {
-            sLastNote = "无障碍正常";
+            if (DshAccessibilityService.isRunning()) {
+                sUnboundSince = 0L;
+                sLastNote = "无障碍正常";
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (sUnboundSince == 0L) sUnboundSince = now;
+            long down = now - sUnboundSince;
+            if (down < UNBOUND_STALE_MS) {
+                sLastNote = "设置是开的，正在等服务绑定（" + (down / 1000) + " 秒）";
+                return;
+            }
+            if (now - sLastRebindAt < REBIND_COOLDOWN_MS) {
+                sLastNote = "服务没绑上，等重挂冷却（"
+                        + Math.max(0, (REBIND_COOLDOWN_MS - (now - sLastRebindAt)) / 1000) + " 秒）";
+                return;
+            }
+            sLastRebindAt = now;
+            boolean ok = Priv.rebind(app);
+            String line = ok
+                    ? "[重挂] 设置是开的但服务没绑上，已让系统重新绑定"
+                    : "[重挂] 失败（写设置被拒）";
+            trace(line + "（已断 " + (down / 1000) + " 秒）");
+            DshService.note(line);
+            sLastNote = ok ? "服务被系统悄悄解绑了，已重新绑定" : "服务没绑上，且重挂失败";
+            if (ok) verifyLater(app, sHealCount);
             return;
         }
 
         long now = System.currentTimeMillis();
+        sUnboundSince = 0L;
 
         /*
          * ⚠️ 这里**刻意不设次数上限**。
@@ -179,6 +230,7 @@ public final class A11yGuard {
             persist(app);
             sLastNote = "已修复（第 " + sHealCount + " 次）";
             Log.i(TAG, "无障碍开关被关掉，已写回；累计 " + sHealCount + " 次");
+            trace("[写回] 设置里的无障碍开关被关，已写回（累计 " + sHealCount + " 次）");
             DshService.note("无障碍守护: 检测到开关被关，已自动写回（累计 " + sHealCount + " 次）");
             // 只在频率确实异常时提醒一次，不刷屏、更不因此停手
             if (sRecentCount == 30 && !sWarnedBurst) {
@@ -222,12 +274,22 @@ public final class A11yGuard {
         boolean running = DshAccessibilityService.isRunning();
         boolean canHeal = Priv.canHeal(c);
         boolean guard = Priv.guardEnabled(c);
+        boolean listed = !Priv.needsHeal(c);
 
         /*
          * 纯文字，不用 emoji —— 这一页要和系统设置那种原生观感一致。
          * 状态用「已开启 / 未开启 / 已关闭」这种词说清楚，比图标更明确。
          */
         sb.append("无障碍服务：").append(running ? "已开启" : "未开启");
+        /*
+         * "设置开着、服务没绑上"是最容易骗人的一种状态：界面看着是开的，
+         * 实际一次注入都执行不了。这里必须两种信息都写出来，
+         * 否则用户只能靠"某个功能突然不灵"来发现它。
+         */
+        if (!running && listed) {
+            sb.append(canHeal ? "（设置里是开的，系统没绑上 —— 守护会自动重挂）"
+                              : "（设置里是开的，系统没绑上）");
+        }
         sb.append('\n');
         if (canHeal) {
             sb.append(guard
@@ -246,4 +308,35 @@ public final class A11yGuard {
         sb.append('\n').append("当前状态：").append(sLastNote);
         return sb.toString();
     }
+
+    /**
+     * 把一行诊断写进 {@code /sdcard/.dsh-phone/a11y-guard.log}。
+     *
+     * <p>理由和 {@link BallWindow#trace(String)} 一样：部分国产 ROM（本机 vivo / Android 16 就是）
+     * **不把正式包的 Java 日志放进 logcat** —— 正式包里 {@code adb logcat} 一条都收不到。
+     * 用户说"权限又掉了、也没自动修"时，光靠 logcat 我们什么都看不见；
+     * 写文件最稳，而且用户可以把文件直接发出来。
+     *
+     * <p>只在**真正的动作**（重挂 / 写回 / 失败）时写一行，轮询本身不写 —— 否则一天能把存储写满。
+     * 超过 64KB 自动重来。
+     */
+    static void trace(String line) {
+        synchronized (TRACE_LOCK) {
+            try {
+                java.io.File dir = new java.io.File("/sdcard/.dsh-phone");
+                if (!dir.exists()) dir.mkdirs();
+                java.io.File f = new java.io.File(dir, "a11y-guard.log");
+                if (f.length() > 64 * 1024) f.delete();
+                java.io.FileOutputStream fo = new java.io.FileOutputStream(f, true);
+                String ts = new java.text.SimpleDateFormat("MM-dd HH:mm:ss",
+                        java.util.Locale.ROOT).format(new java.util.Date());
+                fo.write((ts + "  " + line + "\n").getBytes("UTF-8"));
+                fo.close();
+            } catch (Throwable ignore) {
+                // 没有存储权限之类 → 静默放弃。诊断日志绝不该影响守护本身
+            }
+        }
+    }
+
+    private static final Object TRACE_LOCK = new Object();
 }

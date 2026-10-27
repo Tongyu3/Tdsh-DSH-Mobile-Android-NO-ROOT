@@ -1,0 +1,30 @@
+{
+  "name": "dsh-tts",
+  "version": "1.1.0",
+  "description": "语音朗读：把回复念出来。系统语音（本地、离线、免费）/ 本地模型（手机自己跑开源 TTS 模型，含纳西妲克隆音色）/ 云端 TTS / 自定义接口。输入框下方的小喇叭一键开关，设置进「设置 → 语音朗读」。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": { "default": "./lib/index.js" },
+    "./client": { "default": "./lib/client.js" },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": ["@deepseek-ai/dsh-client-ui-slots"],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": ["dsh", "dsh-plugin", "android", "tts", "read-aloud"],
+  "license": "MIT"
+}

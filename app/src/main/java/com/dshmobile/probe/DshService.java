@@ -438,8 +438,19 @@ public class DshService extends Service {
         long activeAt = 0L;
         /** 上一拍是否"有任务在跑" —— 用来算出"任务刚刚结束"（→ 已完成）。 */
         boolean wasBusy = false;
-        /** 连续几拍 CPU 都在重烧（≥2 才算真的在干活，见下面的说明）。 */
-        int heavyStreak = 0;
+        /**
+         * 判阶段用的 CPU 平滑器（{@link AutoBall.Heater}）。
+         *
+         * <p>原来是"连续两拍都重"就算有任务，实测会把容器里零散的 GC/写盘当成任务，
+         * 让气泡在「思考中 / 已完成 / 空闲」之间每 2–4 秒循环一次（GitHub issue）。
+         * 换成滑动平均后，一次尖峰顶不上去，持续在烧才过线。
+         */
+        AutoBall.Heater heater = new AutoBall.Heater();
+        /**
+         * 阶段判定的跨拍记忆（{@link BallStage.Memo}）：网页最近说了什么、
+         * 上一次"已完成"时 stdout 长什么样。终态粘性就靠它，见 BallStage.POST_DONE_HOLD_MS。
+         */
+        BallStage.Memo stageMemo = new BallStage.Memo();
         /** 带 pid 缓存的采样器（进程列表 20 秒才重扫一次，见 TaskWatch.Sampler）。 */
         TaskWatch.Sampler sampler = null;
         /*
@@ -498,7 +509,6 @@ public class DshService extends Service {
                     sampler = new TaskWatch.Sampler(rootfs, android.os.Process.myPid());
                 }
                 boolean busyNow = false;
-                boolean heavyNow = false;
                 if (snap == null) {
                     // 首次只做基准：没有上一次的读数就算不出增量（下一拍就能算了）
                     snap = sampler.sample(false);
@@ -506,8 +516,9 @@ public class DshService extends Service {
                     TaskWatch.Snap now = sampler.sample(false);
                     long dt = now.at - snap.at;
                     busyNow = AutoBall.busy(snap.cpuMs, now.cpuMs, now.procs, dt);
-                    // 判阶段用更严格的档位：闲着时的 node 也在烧几十毫秒，不能用它说"在思考"
-                    heavyNow = AutoBall.heavyCpu(snap.cpuMs, now.cpuMs, now.procs, dt);
+                    // 判阶段用平滑档位：闲着时的 node 也在烧几十毫秒，单拍判据会抖（见 AutoBall.Heater）
+                    if (now.procs <= 0) heater.reset();
+                    else heater.sample(now.cpuMs - snap.cpuMs, dt);
                     activeAt = AutoBall.markActive(activeAt, now.at, busyNow);
                     snap = now;
                 }
@@ -522,19 +533,18 @@ public class DshService extends Service {
                 /*
                  * 阶段用的"在干活"和显示用的 `busy` **故意不一样**：
                  * `busy` 带 8 秒保持窗口（防止球一闪一闪），但**当前这一刻**是否在干活
-                 * 只有"网页怎么说 + CPU 有没有连续在烧"说得准。
+                 * 只有"网页怎么说 + CPU 有没有持续在烧"说得准。
                  *
                  * 用带保持窗口的那个去判阶段的话，任务结束后会多出几秒的"思考中…"——
                  * 明明已经做完了却说在思考，比不显示更糟（用户盯着气泡就是想看准）。
                  *
-                 * 单拍的重活**也不算数**：容器偶尔一次 GC/写盘就会让增量冒一下，
+                 * 单拍的重活**不算数**：容器偶尔一次 GC/写盘就会让增量冒一下，
                  * 直接采信的话气泡会"思考中 → 已完成"闪一下（实测日志里 16:45:14 那一次）。
-                 * 连续两拍都重才算真的在跑东西 —— 1.5 秒一拍，代价是晚 1.5 秒，
-                 * 换来的是一条不抽搐的气泡。
+                 * 现在交给 {@link AutoBall.Heater}：要求**持续**在烧才算真的在跑东西。
                  */
-                if (heavyNow) heavyStreak++; else heavyStreak = 0;
-                // 网页说在干活就是干活；网页不说话时才看 CPU（且要连续两拍）
-                boolean stageActive = pageBusy() || heavyStreak >= 2;
+                boolean pageActive = pageBusy();
+                // 网页说在干活就是干活；网页不说话时才看 CPU（且要持续）
+                boolean stageActive = pageActive || heater.hot();
                 boolean justFinished = wasBusy && !stageActive;
                 wasBusy = stageActive;
 
@@ -552,7 +562,7 @@ public class DshService extends Service {
                 try {
                     BallWindow.updateStage(this, getCurrentLine(), getCurrentLineAgeMs(),
                             stageActive, justFinished, getState(),
-                            pageStage(), pageStageAge());
+                            pageStage(), pageStageAge(), pageActive, stageMemo, heater.pct());
                     /*
                      * 气泡正开着时，让它的文案跟着阶段走。
                      * 不刷新的话，用户把气泡放着不动就永远停在第一次打开时的那句话 ——
