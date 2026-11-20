@@ -334,7 +334,7 @@ public class RelayActivity extends Activity {
                             + " 个（不认识的可先去掉，支持图像的记得点亮「文本+图像」）");
                     appendReport("  [中转站] " + r.id + " 发现 " + found.size()
                             + " 个模型，新加入 " + added + " 个\n");
-                    render();
+                    if (added > 0) render();
                 });
             }, "relay-discover").start();
         }));

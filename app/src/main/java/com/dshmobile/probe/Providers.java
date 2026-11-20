@@ -4,8 +4,10 @@ import android.content.Context;
 import android.content.SharedPreferences;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -35,6 +37,7 @@ public final class Providers {
     private static final String K_LIST = "relay_providers";
     private static final String K_KEYS = "relay_keys";          // id → 密钥（只在本机）
     private static final String K_OWNED = "relay_owned_ids";    // 我们写进 DSH 设置过的 id
+    private static final int MAX_MODEL_LIST_BYTES = 8 * 1024 * 1024;
 
     private static SharedPreferences sp(Context c) {
         return c.getSharedPreferences(PhoneBridge.PREFS, Context.MODE_PRIVATE);
@@ -262,26 +265,50 @@ public final class Providers {
     /**
      * 问一遍这个中转站有哪些模型（同步方法，调用方要放工作线程）。
      *
-     * <p>两条路，与 DSH 自己的行为一致（见 pi-ai README）：
+     * <p>优先使用当前协议与 API 地址对应的端点。遇到端点不存在、响应格式不对或
+     * 模型列表为空时，再检查同一地址带或不带 {@code /v1} 的另一种端点。
      * <ul>
-     *   <li>OpenAI 系：{@code GET {baseURL}/models} + {@code Authorization: Bearer}；</li>
-     *   <li>Anthropic 原生：{@code GET /v1/models?limit=1000} + {@code x-api-key}
-     *       与 {@code anthropic-version}（列表地址接受带或不带 /v1）。</li>
+     *   <li>OpenAI 系：{@code Authorization: Bearer}，优先使用用户填的 API 前缀；</li>
+     *   <li>Anthropic 原生：{@code x-api-key} 与 {@code anthropic-version}，
+     *       优先使用 {@code /v1/models?limit=1000}。</li>
      * </ul>
      */
     public static List<Relay.Model> discover(Relay.Route r, String apiKey) throws Exception {
         String base = r.baseUrl == null ? "" : r.baseUrl.trim();
         while (base.endsWith("/")) base = base.substring(0, base.length() - 1);
         if (base.isEmpty()) throw new IllegalStateException("先填 API 地址");
+        URL baseUrl = new URL(base);
+        if (baseUrl.getQuery() != null || baseUrl.getRef() != null) {
+            throw new IllegalStateException("API 地址请填写基础地址，不带查询参数或片段");
+        }
         boolean anthropic = Relay.API_ANTHROPIC.equals(r.api);
-        String url = anthropic
-                ? (base.endsWith("/v1") ? base + "/models?limit=1000" : base + "/v1/models?limit=1000")
-                : base + "/models";
+        boolean hasVersion = baseUrl.getPath().endsWith("/v1");
+        String prefix = hasVersion ? base.substring(0, base.length() - 3) : base;
+        String suffix = anthropic ? "/models?limit=1000" : "/models";
+        URL versioned = new URL(prefix + "/v1" + suffix);
+        URL unversioned = new URL(prefix + suffix);
+        URL first = hasVersion || anthropic ? versioned : unversioned;
+        URL second = hasVersion || anthropic ? unversioned : versioned;
         String key = apiKey == null ? "" : apiKey.trim();
+        String firstResult;
+        try {
+            List<Relay.Model> models = discoverAt(first, key, anthropic);
+            if (!models.isEmpty()) return models;
+            firstResult = first.getPath() + " 未返回模型";
+        } catch (ModelListEndpointException e) {
+            firstResult = e.getMessage();
+        }
+        try {
+            return discoverAt(second, key, anthropic);
+        } catch (ModelListEndpointException e) {
+            throw new IllegalStateException(firstResult + "；" + e.getMessage());
+        }
+    }
 
+    private static List<Relay.Model> discoverAt(URL url, String key, boolean anthropic) throws Exception {
         HttpURLConnection conn = null;
         try {
-            conn = (HttpURLConnection) new URL(url).openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(15000);
             conn.setReadTimeout(30000);
@@ -292,26 +319,48 @@ public final class Providers {
                 conn.setRequestProperty("Authorization", "Bearer " + key);
             }
             int code = conn.getResponseCode();
-            InputStream in = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
-            String body = readAll(in, 512 * 1024);
+            if (code == 404 || code == 405) {
+                throw new ModelListEndpointException(url.getPath() + " 返回 HTTP " + code);
+            }
             if (code < 200 || code >= 300) {
-                throw new IllegalStateException("HTTP " + code + "："
+                String body = readAll(conn.getErrorStream(), 512 * 1024);
+                throw new IllegalStateException(url.getPath() + " 返回 HTTP " + code + "："
                         + body.replaceAll("\\s+", " ").trim());
             }
-            return parseModelList(body);
+            try (InputStream in = conn.getInputStream()) {
+                ByteArrayOutputStream body = new ByteArrayOutputStream();
+                byte[] buffer = new byte[8192];
+                int count;
+                while ((count = in.read(buffer)) != -1) {
+                    if (count > MAX_MODEL_LIST_BYTES - body.size()) {
+                        throw new IllegalStateException("模型列表响应超过 8 MiB");
+                    }
+                    body.write(buffer, 0, count);
+                }
+                return parseModelList(new String(body.toByteArray(), StandardCharsets.UTF_8));
+            } catch (JSONException e) {
+                throw new ModelListEndpointException(url.getPath() + " 未返回有效的 JSON 模型目录");
+            }
         } finally {
             if (conn != null) conn.disconnect();
+        }
+    }
+
+    private static final class ModelListEndpointException extends Exception {
+        ModelListEndpointException(String message) {
+            super(message);
         }
     }
 
     /**
      * 解析"有哪些模型"的返回体。
      *
-     * <p>见过的三种形态：
+     * <p>见过的返回形态：
      * <pre>
      *   {"data":[{"id":"grok-4.7"},{"id":"grok-4.6"}]}           // OpenAI 系
      *   {"data":["grok-4.7","grok-4.6"]}                         // 有的中转站只给字符串
      *   {"models":[{"id":"claude-sonnet-4","max_tokens":64000}]}  // Anthropic 原生
+     *   {"models":[{"slug":"gpt-6.2-sol","display_name":"GPT 6.2 Sol"}]} // 使用 slug 的网关
      * </pre>
      * 去重、去空、保持服务端给的顺序。
      */
@@ -329,7 +378,7 @@ public final class Providers {
                 id = (String) item;
             } else if (item instanceof JSONObject) {
                 JSONObject mo = (JSONObject) item;
-                id = mo.optString("id", mo.optString("name", ""));
+                id = mo.optString("id", mo.optString("slug", mo.optString("name", "")));
                 name = mo.optString("display_name", mo.optString("name", ""));
             }
             if (id == null || id.trim().isEmpty()) continue;
