@@ -424,8 +424,10 @@ public class AppControlActivity extends Activity {
         if (shotStatus != null) {
             boolean a11y = Screenshot.a11yAvailable();
             boolean proj = Screenshot.projectionAlive();
-            shotStatus.setText(Screenshot.describe(this));
-            shotStatus.setTextColor(a11y || proj
+            boolean rootCapture = ShellControl.MODE_ROOT.equals(ShellControl.mode(this));
+            shotStatus.setText(rootCapture ? "截图方式：Root" : Screenshot.describe(this));
+            if (shotButton != null) shotButton.setVisibility(rootCapture ? android.view.View.GONE : android.view.View.VISIBLE);
+            shotStatus.setTextColor(rootCapture || a11y || proj
                     ? Color.parseColor("#4CAF50") : Color.parseColor("#FF7043"));
             if (shotButton != null) {
                 // 无障碍那条路可用时，录屏只是兜底

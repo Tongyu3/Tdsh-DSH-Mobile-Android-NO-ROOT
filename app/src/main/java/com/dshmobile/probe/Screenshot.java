@@ -230,6 +230,36 @@ public final class Screenshot {
         return s;
     }
 
+    /** 通过系统 screencap 获取普通显示画面。调用方负责前台白名单校验。 */
+    static Shot captureRoot(Context c) {
+        Shot shot = new Shot();
+        shot.backend = "Root";
+        File png = null;
+        Process process = null;
+        try {
+            png = File.createTempFile("root-shot-", ".png", c.getCacheDir());
+            process = new ProcessBuilder("su", "-c", "/system/bin/screencap -p")
+                    .redirectOutput(png).start();
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                shot.error = "Root 截图超时";
+            } else if (process.exitValue() != 0) {
+                shot.error = "Root 截图失败，请检查 KernelSU 对本应用的授权";
+            } else {
+                shot.bitmap = android.graphics.BitmapFactory.decodeFile(png.getAbsolutePath());
+                if (shot.bitmap == null) shot.error = "Root 截图未返回有效画面";
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            shot.error = "Root 截图已中断";
+        } catch (Exception e) {
+            shot.error = "Root 截图失败: " + e.getMessage();
+        } finally {
+            if (process != null) process.destroyForcibly();
+            if (png != null) png.delete();
+        }
+        return shot;
+    }
+
     /** 无障碍截屏（API 30+，不需要额外授权）。 */
     private static Bitmap grabViaAccessibility() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null;

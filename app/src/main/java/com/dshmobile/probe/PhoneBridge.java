@@ -565,6 +565,24 @@ public final class PhoneBridge {
      * 因此前台应用不在白名单里时**一律拒绝**，跟 /ui 完全一致 ——
      * 不能出现"点不了但能截"这种漏洞。
      */
+    private static Screenshot.Shot captureAllowedFrame(Context ctx, String expected) {
+        if (!ShellControl.MODE_ROOT.equals(ShellControl.mode(ctx))) return Screenshot.capture(ctx);
+
+        if (!expected.equals(ShellControl.foreground(ctx)) || !allowed(ctx).contains(expected)) {
+            Screenshot.Shot denied = new Screenshot.Shot();
+            denied.error = "前台应用已切换或不在白名单，已拒绝截图";
+            return denied;
+        }
+        Screenshot.Shot shot = Screenshot.captureRoot(ctx);
+        if (shot.bitmap != null && (!expected.equals(ShellControl.foreground(ctx))
+                || !allowed(ctx).contains(expected))) {
+            shot.bitmap.recycle();
+            shot.bitmap = null;
+            shot.error = "截图期间前台应用或白名单发生变化，已丢弃画面";
+        }
+        return shot;
+    }
+
     private static String shot(Context ctx, java.util.Map<String, String> p) {
         java.util.Set<String> allow = allowed(ctx);
         if (allow.isEmpty()) {
@@ -575,7 +593,7 @@ public final class PhoneBridge {
             return "ERROR 当前前台应用 [" + fg + "] 不在白名单里，已拒绝截图\n";
         }
 
-        Screenshot.Shot s = Screenshot.capture(ctx);
+        Screenshot.Shot s = captureAllowedFrame(ctx, fg);
         if (s.bitmap == null) {
             return "ERROR " + s.error + "\n";
         }
@@ -677,7 +695,7 @@ public final class PhoneBridge {
             if (wait > 0) {
                 try { Thread.sleep(wait); } catch (InterruptedException ie) { break; }
             }
-            Screenshot.Shot s = Screenshot.capture(ctx);
+            Screenshot.Shot s = captureAllowedFrame(ctx, fg);
             if (s.bitmap == null) {
                 lastErr = s.error;
                 continue;
