@@ -3496,7 +3496,7 @@ public class MainActivity extends Activity {
     // ── TEST 8 / TEST 9 · Phase 1b：Node + DSH ─────────────────
     //
     // 包级可见（去掉 private）是给 {@link Region} 用的：Node 的下载源要按地区排序。
-    static final String NODE_VERSION = "v22.23.2";
+    static final String NODE_VERSION = "v24.13.0";
     static final String NODE_DIR = "node-" + NODE_VERSION + "-linux-arm64";
 
     /** TEST 8：在容器里装上 Node.js（官方 arm64 glibc 构建）。 */
@@ -3608,7 +3608,7 @@ public class MainActivity extends Activity {
                      */
                     String[] regs = Region.npmRegistries(this);
                     String registry = TEMP_BROKEN_REGISTRY != null ? TEMP_BROKEN_REGISTRY
-                            : (attempt >= 3 ? regs[1] : regs[0]);
+                            : "https://registry.npmjs.org";
                     try {
                         code = execStreaming(new String[]{
                                 new File(base, "proot").getAbsolutePath(),
@@ -3622,7 +3622,7 @@ public class MainActivity extends Activity {
                                 "npm_config_fetch_timeout=60000",
                                 "npm_config_fetch_retries=3",
                                 "npm_config_update_notifier=false",
-                                nodePath + "/npm", "install", "-g", "@deepseek-ai/dsh",
+                                nodePath + "/npm", "install", "-g", "@deepseek-ai/dsh@0.2.2-rc.5",
                                 "--no-audit", "--no-fund", "--loglevel=http"},
                                 libDir, sb, NPM_TIMEOUT_MS, NPM_IDLE_MS);
                     } catch (java.util.concurrent.TimeoutException te) {
@@ -3631,7 +3631,7 @@ public class MainActivity extends Activity {
                         return sb + "  结果 : ❌ FAIL — npm install 卡死（" + te.getMessage() + "）\n";
                     }
                     progress(sb, "  npm 退出码: " + code + "（源: " + registry + "）\n");
-                    ok = dshBin.exists();
+                    ok = code == 0 && dshBin.exists();
                 }
 
                 if (!ok) {

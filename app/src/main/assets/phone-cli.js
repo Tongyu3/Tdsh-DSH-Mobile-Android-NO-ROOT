@@ -1,4 +1,4 @@
-#!/opt/node-v22.23.2-linux-arm64/bin/node
+#!/opt/node-v24.13.0-linux-arm64/bin/node
 /*
  * phone —— 让 agent 操作手机的控制台工具。
  *

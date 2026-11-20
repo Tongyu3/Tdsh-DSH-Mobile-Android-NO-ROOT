@@ -18,5 +18,5 @@ public final class NodeInfo {
     private NodeInfo() { }
 
     /** 容器里 Node 的版本目录名（与 rootfs 的 /opt 下那一个一致）。 */
-    public static final String NODE_DIR = "node-v22.23.2-linux-arm64";
+    public static final String NODE_DIR = "node-v24.13.0-linux-arm64";
 }
