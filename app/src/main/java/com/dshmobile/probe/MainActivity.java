@@ -2672,12 +2672,20 @@ public class MainActivity extends Activity {
         splashProgress(0.45f);          // 容器已解包完成，进入装 Node
         String t8 = testNode(base, rootfs, libDir, new StringBuilder()); r.append(t8).append('\n');
         appendReport("TEST 8 · 容器内安装 Node.js\n" + t8 + "\n");
+        if (!t8.contains("✅ PASS")) {
+            onProvisionFailed(new IllegalStateException("Node.js 安装失败，已停止部署。请查看 TEST 8 日志。"));
+            return;
+        }
         splashProgress(0.58f);
 
         r.append("TEST 9 · Phase 1b：容器内安装并运行 DSH\n");
         splashProgress(0.62f);          // 装 DSH 是最慢的一段（npm install 可能十几分钟）
         String t9 = testDsh(base, rootfs, libDir, new StringBuilder()); r.append(t9).append('\n');
         appendReport("TEST 9 · 容器内安装 DSH\n" + t9 + "\n");
+        if (!t9.contains("✅ PASS")) {
+            onProvisionFailed(new IllegalStateException("DSH 安装失败，已停止部署。请查看 TEST 9 日志。"));
+            return;
+        }
         splashProgress(0.86f);          // DSH 装完
 
         // ── 手机存储访问（容器能否看到手机文件）──
