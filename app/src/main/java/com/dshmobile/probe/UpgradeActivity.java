@@ -36,6 +36,8 @@ public class UpgradeActivity extends Activity {
 
     private String currentVer;
     private KernelUpgrade.Tags tags;
+    private boolean checking;
+    private boolean upgrading;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -110,6 +112,7 @@ public class UpgradeActivity extends Activity {
         root.addView(buildAppUpdateCard());
 
         setContentView(scroll);
+        channel.setOnCheckedChangeListener((group, checkedId) -> updateTarget());
         check(true);
     }
 
@@ -142,12 +145,15 @@ public class UpgradeActivity extends Activity {
         card.addView(notes);
 
         card.addView(Ui.button(this, "检查 App 更新", true, v -> {
+            v.setEnabled(false);
             state.setText("正在查 GitHub Releases…");
             notes.setText("");
             new Thread(() -> {
                 final AppUpdate.Info info = AppUpdate.fetchLatest(this, true);
                 final String cur = AppUpdate.currentVersion(this);
                 runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    v.setEnabled(true);
                     if (info == null) {
                         state.setText("查不到（没网 / GitHub 不通）—— 当前 v" + cur);
                         return;
@@ -199,32 +205,43 @@ public class UpgradeActivity extends Activity {
 
     /** 查版本（联网，必须离开 UI 线程）。 */
     private void check(final boolean initial) {
+        if (checking || upgrading) return;
+        checking = true;
+        upgradeBtn.setEnabled(false);
         current.setText("当前内核：" + (currentVer == null ? "读取中…" : currentVer));
         latest.setText(initial ? "正在检查最新版本…" : "正在检查…");
         new Thread(() -> {
             final String cur = KernelUpgrade.installedVersion(this);
             final KernelUpgrade.Tags t = KernelUpgrade.fetchTags(this, !initial);
             runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                checking = false;
                 currentVer = cur;
                 tags = t;
                 current.setText("当前内核：" + (cur == null ? "读不到（容器可能还没装好）" : cur));
-                if (t == null) {
-                    latest.setText("查不到最新版本（没网？registry 不通？）");
-                    upgradeBtn.setEnabled(false);
-                    return;
-                }
-                String target = chosenVersion();
-                boolean newer = cur == null || target == null
-                        || KernelUpgrade.compare(target, cur) > 0;
-                latest.setText("npm 上：latest=" + t.latest + "   next=" + t.next
-                        + "\n当前选择的 " + chosenTag() + " = " + target
-                        + (newer ? "  ← 比你现在的新，可以升级" : "  （已经是最新，无需升级）"));
-                upgradeBtn.setEnabled(newer && target != null);
+                updateTarget();
             });
         }, "dsh-upgrade-check").start();
     }
 
+    private void updateTarget() {
+        if (checking || upgrading) return;
+        if (tags == null) {
+            latest.setText("查不到最新版本（没网？registry 不通？）");
+            upgradeBtn.setEnabled(false);
+            return;
+        }
+        String target = chosenVersion();
+        boolean newer = target != null
+                && (currentVer == null || KernelUpgrade.compare(target, currentVer) > 0);
+        latest.setText("npm 上：latest=" + tags.latest + "   next=" + tags.next
+                + "\n当前选择的 " + chosenTag() + " = " + (target == null ? "暂无版本" : target)
+                + (newer ? "  ← 可以升级" : ""));
+        upgradeBtn.setEnabled(newer);
+    }
+
     private void confirmUpgrade() {
+        if (!upgradeBtn.isEnabled()) return;
         final String v = chosenVersion();
         if (v == null) return;
         new AlertDialog.Builder(this)
@@ -240,22 +257,29 @@ public class UpgradeActivity extends Activity {
     }
 
     private void runUpgrade(final String v) {
+        if (checking || upgrading) return;
+        upgrading = true;
         upgradeBtn.setEnabled(false);
         log.setText("");
         Toast.makeText(this, "开始升级到 " + v + "…", Toast.LENGTH_SHORT).show();
         new Thread(() -> {
             String err = KernelUpgrade.upgrade(this, v, line ->
                     runOnUiThread(() -> {
+                        if (isFinishing() || isDestroyed()) return;
                         log.append(line + "\n");
                         // 只留最后几十行，免得 TextView 越滚越长
                         CharSequence t = log.getText();
                         if (t.length() > 6000) log.setText(t.subSequence(t.length() - 6000, t.length()));
                     }));
             runOnUiThread(() -> {
+                upgrading = false;
+                if (err == null) {
+                    KernelUpgrade.clearNotify(this);
+                    DshService.requestRestart();
+                }
+                if (isFinishing() || isDestroyed()) return;
                 if (err == null) {
                     Toast.makeText(this, "升级完成，正在重启内核…", Toast.LENGTH_LONG).show();
-                    // 重启 dsh web，让新版本真正生效
-                    DshService.requestRestart();
                     new AlertDialog.Builder(this)
                             .setTitle("升级成功")
                             .setMessage("已升级到 " + v + "。\n\n"

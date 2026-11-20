@@ -224,8 +224,23 @@ public final class KernelUpgrade {
      *
      * @return null 表示成功，否则是失败原因
      */
+    private static final java.util.concurrent.atomic.AtomicBoolean installing =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
     public static String upgrade(Context c, final String version, final Progress cb) {
         if (version == null || version.isEmpty()) return "没有指定目标版本";
+        if (!version.matches("[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?(?:[+][0-9A-Za-z.-]+)?")) {
+            return "目标版本格式无效";
+        }
+        if (!installing.compareAndSet(false, true)) return "已有内核升级正在进行";
+        try {
+            return installVersion(c, version, cb);
+        } finally {
+            installing.set(false);
+        }
+    }
+
+    private static String installVersion(Context c, String version, Progress cb) {
         if (!Priv.canHeal(c)) {
             // npm 走网络，不需要额外权限；这里只是提前说明"没授权也能升级"
             Log.i(TAG, "没有一次性授权，但内核升级不需要它");

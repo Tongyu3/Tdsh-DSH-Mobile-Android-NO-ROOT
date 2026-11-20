@@ -767,6 +767,7 @@ public final class BallWindow {
     }
 
     private void detach() {
+        ui.removeCallbacks(autoCollapse);
         try {
             if (web != null) {
                 web.stopLoading();
@@ -969,7 +970,7 @@ public final class BallWindow {
      * 这既消灭了摆动，也顺带省掉了每拍一次无意义的窗口重排（那本身也会闪）。
      */
     private void applyMode(int newMode, boolean animate) {
-        if (dotView == null || bubbleView == null || fullView == null || lp == null) return;
+        if (root == null || dotView == null || bubbleView == null || fullView == null || lp == null) return;
 
         /*
          * ⚠️ 这里**不再**从 lp 反读 ballX/ballY。

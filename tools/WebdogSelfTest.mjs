@@ -28,7 +28,7 @@ import vm from 'node:vm';
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const patchPath = join(here, 'patch.js');
-const assetPath = join(root, 'DshMobile', 'app', 'src', 'main', 'assets', 'dsh-mobile.js');
+const assetPath = join(root, 'app', 'src', 'main', 'assets', 'dsh-mobile.js');
 
 let failures = 0;
 function check(name, cond, extra) {

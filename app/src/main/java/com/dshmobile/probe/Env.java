@@ -500,7 +500,11 @@ public final class Env {
                     String line;
                     while ((line = br.readLine()) != null) {
                         synchronized (sb) {
-                            if (sb.length() < 200000) sb.append(line).append('\n');
+                            int remaining = 200_000 - sb.length();
+                            if (remaining > 0) {
+                                sb.append(line, 0, Math.min(line.length(), remaining));
+                                if (sb.length() < 200_000) sb.append('\n');
+                            }
                         }
                         if (onLine != null) {
                             try { onLine.accept(line); } catch (Throwable ignore) { }
@@ -511,7 +515,7 @@ public final class Env {
             reader.setDaemon(true);
             reader.start();
             if (!Proc.waitFor(p, timeoutMs)) {
-                p.destroy();
+                Proc.killForcibly(p);
                 android.util.Log.w("DSH_ENV", "容器命令超时（" + timeoutMs + "ms）");
                 return null;
             }

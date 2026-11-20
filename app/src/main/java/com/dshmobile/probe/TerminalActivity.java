@@ -57,6 +57,7 @@ public class TerminalActivity extends Activity {
 
     /** 命令超时：给足 npm 之类慢命令的时间，又不至于卡死界面。 */
     private static final long TIMEOUT_MS = 60_000L;
+    private static final int MAX_OUTPUT_CHARS = 200_000;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -112,6 +113,7 @@ public class TerminalActivity extends Activity {
         input.setBackground(Ui.inputBg(this));      // 底色随主题（原来吃系统默认下划线）
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         input.setTypeface(android.graphics.Typeface.MONOSPACE);
+        input.setSingleLine(true);
         input.setImeOptions(EditorInfo.IME_ACTION_GO);
         input.setOnEditorActionListener((v, actionId, ev) -> {
             if (actionId == EditorInfo.IME_ACTION_GO) { run(input.getText().toString()); return true; }
@@ -173,18 +175,10 @@ public class TerminalActivity extends Activity {
         input.setText("");
 
         append("$ " + cmd + "\n");
-        final StringBuilder buf = new StringBuilder();
         io.execute(() -> {
             try {
-                /*
-                 * onLine 回调发生在**读线程**上，不能碰 UI —— 所以先攒进 buffer，
-                 * 再按行 post 到主线程（每行一次 post，命令输出多时也不会卡）。
-                 */
-                String all = Env.execInContainer(this, cmd, TIMEOUT_MS, line -> {
-                    synchronized (buf) { buf.append(line).append('\n'); }
-                    final String l = line;
-                    ui.post(() -> append(l + "\n"));
-                });
+                String all = Env.execInContainer(this, cmd, TIMEOUT_MS, line ->
+                        ui.post(() -> append(line + "\n")));
                 final String tail;
                 if (all == null) tail = "\n[命令超时或容器没起来 —— 已产生的输出在上面]\n";
                 else if (all.isEmpty()) tail = "[没有输出]\n";
@@ -198,13 +192,23 @@ public class TerminalActivity extends Activity {
 
     /** 追加输出并贴到底部（不贴底的话用户要自己往下拉，体验很差）。 */
     private void append(String s) {
-        out.append(s);
+        if (isFinishing() || isDestroyed()) return;
+        if (s.length() >= MAX_OUTPUT_CHARS) {
+            out.setText(s.substring(s.length() - MAX_OUTPUT_CHARS));
+        } else {
+            if (out.length() + s.length() > MAX_OUTPUT_CHARS) {
+                int keep = Math.min(out.length(), (MAX_OUTPUT_CHARS - s.length()) / 2);
+                out.setText(out.getText().subSequence(out.length() - keep, out.length()));
+            }
+            out.append(s);
+        }
         outScroll.post(() -> outScroll.fullScroll(ScrollView.FOCUS_DOWN));
     }
 
     @Override
     protected void onDestroy() {
         io.shutdownNow();
+        ui.removeCallbacksAndMessages(null);
         super.onDestroy();
     }
 }
