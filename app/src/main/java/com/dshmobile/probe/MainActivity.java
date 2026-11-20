@@ -3602,11 +3602,6 @@ public class MainActivity extends Activity {
                         Env.deleteRecursively(new File(rootfs,
                                 "opt/" + NODE_DIR + "/lib/node_modules/@deepseek-ai"));
                     }
-                    /*
-                     * 主源按地区选（大陆 = npmmirror，海外 = npmjs.org），
-                     * 第 3 次强制换成另一个 —— 镜像偶发缺包/损坏时这是唯一的出路。
-                     */
-                    String[] regs = Region.npmRegistries(this);
                     String registry = TEMP_BROKEN_REGISTRY != null ? TEMP_BROKEN_REGISTRY
                             : "https://registry.npmjs.org";
                     try {
