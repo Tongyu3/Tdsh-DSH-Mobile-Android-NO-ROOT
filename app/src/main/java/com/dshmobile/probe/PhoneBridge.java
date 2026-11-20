@@ -1047,6 +1047,11 @@ public final class PhoneBridge {
      * </ul>
      */
     private static String privSh(Context ctx, java.util.Map<String, String> p) {
+        if (ShellControl.MODE_ROOT.equals(ShellControl.mode(ctx))) {
+            return "当前选用 Root 手机控制。打开应用、读取界面、点击和滑动请使用 phone 工具，"
+                    + "并遵守应用允许列表。Root 手机控制无需 Shizuku。";
+        }
+
         String backend = ShizukuBridge.privilegedBackend(ctx);
         String cmd = p.get("cmd");
         if (cmd == null || cmd.trim().isEmpty()) {

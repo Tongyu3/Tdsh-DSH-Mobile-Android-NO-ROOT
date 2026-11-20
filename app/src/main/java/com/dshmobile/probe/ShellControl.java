@@ -177,8 +177,12 @@ public final class ShellControl {
 
     public static String status(Context c) {
         StringBuilder sb = new StringBuilder();
-        sb.append("操作后端: 直接命令（Shizuku）\n");
-        sb.append("Shizuku: ").append(ShizukuBridge.statusText(c)).append('\n');
+        sb.append("操作后端: ").append(describe(c)).append('\n');
+        if (MODE_ROOT.equals(mode(c))) {
+            sb.append("Root: 已授权，点击、滑动、按键和打开应用请使用 phone 工具\n");
+        } else {
+            sb.append("Shizuku: ").append(ShizukuBridge.statusText(c)).append('\n');
+        }
         Set<String> allow = PhoneBridge.allowed(c);
         String fg = foreground(c);
         sb.append("当前前台: ").append(fg == null ? "(未知)" : fg).append('\n');
