@@ -38,6 +38,7 @@ public final class ShellControl {
 
     public static final String MODE_A11Y = "a11y";
     public static final String MODE_SHELL = "shell";
+    public static final String MODE_ROOT = "root";
 
     private static final String PREF_MODE = "control_backend";
     private static final String TMP_XML = "/data/local/tmp/dsh_ui.xml";
@@ -56,7 +57,7 @@ public final class ShellControl {
 
     /** 当前选了 shell 模式，并且真的有 shell 可用。 */
     public static boolean active(Context c) {
-        return MODE_SHELL.equals(mode(c)) && available();
+        return MODE_ROOT.equals(mode(c)) || (MODE_SHELL.equals(mode(c)) && available());
     }
 
     /** Shizuku 在跑、且给过我们权限。 */
@@ -71,6 +72,7 @@ public final class ShellControl {
     /** 界面用的一句话状态。 */
     public static String describe(Context c) {
         String m = mode(c);
+        if (MODE_ROOT.equals(m)) return "直接命令（Root）";
         if (MODE_SHELL.equals(m)) {
             return available()
                     ? "直接命令（Shizuku）"
@@ -83,7 +85,11 @@ public final class ShellControl {
 
     /** 跑一条 shell 命令，返回合并后的输出。 */
     private static String sh(Context c, String cmd) throws Exception {
-        String r = ShizukuBridge.execShell(c, cmd);
+        boolean root = MODE_ROOT.equals(mode(c));
+        if (root && !ShizukuBridge.rootAvailable(false)) {
+            throw new IllegalStateException("Root 不可用，请在手机控制页授权");
+        }
+        String r = root ? ShizukuBridge.execAsRoot(cmd) : ShizukuBridge.execShell(c, cmd);
         if (r == null) return "";
         int nl = r.indexOf('\n');
         String head = nl < 0 ? r : r.substring(0, nl);

@@ -1352,6 +1352,10 @@ public final class PhoneBridge {
          */
         if (ShellControl.active(ctx)) {
             try {
+                if (ShellControl.MODE_ROOT.equals(ShellControl.mode(ctx))
+                        && !ShizukuBridge.rootAvailable(false)) {
+                    return "ERROR Root 不可用，请在手机控制页授权\n";
+                }
                 switch (path) {
                     case "/status": return ShellControl.status(ctx);
                     case "/ui":     return ShellControl.dumpUi(ctx);

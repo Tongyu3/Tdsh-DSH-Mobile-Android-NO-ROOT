@@ -204,6 +204,29 @@ public class AppControlActivity extends Activity {
             refreshStatus();
         });
         cBackend.addView(backendSwitch);
+        boolean useRoot = ShellControl.MODE_ROOT.equals(ShellControl.mode(this));
+        cBackend.addView(Ui.button(this, useRoot ? "关闭 Root 直接命令" : "用 Root 直接命令操作",
+                false, v -> {
+                    if (useRoot) {
+                        ShellControl.setMode(this, ShellControl.MODE_A11Y);
+                        recreate();
+                        return;
+                    }
+                    v.setEnabled(false);
+                    new Thread(() -> {
+                        boolean granted = ShizukuBridge.rootAvailable(true);
+                        runOnUiThread(() -> {
+                            if (granted) {
+                                ShellControl.setMode(this, ShellControl.MODE_ROOT);
+                                recreate();
+                            } else {
+                                v.setEnabled(true);
+                                Toast.makeText(this, "请在 KernelSU 中授权 Tdsh 测试版",
+                                        Toast.LENGTH_LONG).show();
+                            }
+                        });
+                    }, "phone-root-probe").start();
+                }));
 
         /*
          * 白名单**不再挤在这一页**。
