@@ -125,6 +125,17 @@ public final class Region {
      * 所以必须写进去。第一顺位按地区选，后面几个都是兜底。
      */
     public static String resolvConf(Context c) {
+        android.net.ConnectivityManager connectivity =
+                c.getSystemService(android.net.ConnectivityManager.class);
+        android.net.Network network = connectivity == null ? null : connectivity.getActiveNetwork();
+        android.net.LinkProperties link = network == null ? null : connectivity.getLinkProperties(network);
+        if (link != null && !link.getDnsServers().isEmpty()) {
+            StringBuilder config = new StringBuilder();
+            for (java.net.InetAddress address : link.getDnsServers()) {
+                config.append("nameserver ").append(address.getHostAddress()).append('\n');
+            }
+            return config.toString();
+        }
         return isCn(c)
                 ? "nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 8.8.8.8\n"
                 : "nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 223.5.5.5\n";
